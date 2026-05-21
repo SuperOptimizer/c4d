@@ -3,6 +3,7 @@
 // and reports PSNR + compression ratio per quality knob (the start of the §7.1
 // metric basket). encode/decode/compact are filled in as the archive lands.
 #include "c4d/chunk.hpp"
+#include "c4d/archive.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -67,6 +68,121 @@ static int bench(int argc, char** argv) {
     return 0;
 }
 
+static void write_file(const std::string& path, std::span<const u8> bytes) {
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+}
+
+// Slice the logical volume into padded 128^3 chunks (Z,Y,X), encode each, and
+// write a single-member intensity archive. Edge chunks zero-padded (§2).
+static int encode(int argc, char** argv) {
+    Coord3 shape{}; f32 q = 16.f; std::string in, out;
+    std::vector<std::string> pos;
+    for (int i = 2; i < argc; ++i) {
+        std::string_view a = argv[i];
+        if (a == "--shape" && i + 1 < argc) {
+            std::sscanf(argv[++i], "%llu,%llu,%llu",
+                        (unsigned long long*)&shape.z, (unsigned long long*)&shape.y,
+                        (unsigned long long*)&shape.x);
+        } else if (a == "--q" && i + 1 < argc) {
+            q = std::strtof(argv[++i], nullptr);
+        } else pos.push_back(std::string(a));
+    }
+    if (pos.size() != 2 || shape.z == 0) {
+        std::fprintf(stderr, "usage: c4d encode <raw_volume> <archive.c4d> --shape Z,Y,X [--q N]\n");
+        return 2;
+    }
+    in = pos[0]; out = pos[1];
+    auto vol = read_file(in);
+    u64 expect = shape.z * shape.y * shape.x;
+    if (vol.size() != expect) {
+        std::fprintf(stderr, "input is %zu bytes, shape implies %llu\n", vol.size(),
+                     (unsigned long long)expect);
+        return 1;
+    }
+    Coord3 g = chunk_grid(shape);
+    u64 nchunks = g.z * g.y * g.x;
+    std::vector<std::vector<u8>> payloads(nchunks);
+    std::vector<f32> qs(nchunks, q);
+    std::vector<u8> cube(CHUNK_VOX);
+    for (u64 ci = 0; ci < nchunks; ++ci) {
+        Coord3 c = chunk_unravel(ci, g);
+        // gather a zero-padded 128^3 cube from the volume at chunk coord c
+        std::fill(cube.begin(), cube.end(), u8(0));
+        u64 z0 = c.z * CHUNK, y0 = c.y * CHUNK, x0 = c.x * CHUNK;
+        bool any = false;
+        for (u32 dz = 0; dz < CHUNK && z0 + dz < shape.z; ++dz)
+            for (u32 dy = 0; dy < CHUNK && y0 + dy < shape.y; ++dy) {
+                u64 src = ((z0 + dz) * shape.y + (y0 + dy)) * shape.x + x0;
+                u32 w = static_cast<u32>(std::min<u64>(CHUNK, shape.x - x0));
+                std::memcpy(&cube[vox_index(dz, dy, 0)], &vol[src], w);
+                any = true;
+            }
+        if (!any) { payloads[ci] = {}; continue; }   // fully outside -> ABSENT
+        payloads[ci] = chunk::encode_chunk(cube, q).serialize();
+    }
+    archive::Writer w;
+    w.add_member("intensity", archive::MemberType::Intensity, shape, payloads, qs);
+    char meta[128];
+    std::snprintf(meta, sizeof meta, R"({"bbox":[%llu,%llu,%llu]})",
+                  (unsigned long long)shape.z, (unsigned long long)shape.y,
+                  (unsigned long long)shape.x);
+    w.set_metadata(meta);
+    auto file = w.finish();
+    write_file(out, file);
+    std::fprintf(stderr, "encoded %llu chunks -> %s (%zu bytes, %.1fx)\n",
+                 (unsigned long long)nchunks, out.c_str(), file.size(),
+                 double(expect) / file.size());
+    return 0;
+}
+
+static int decode(int argc, char** argv) {
+    if (argc < 4) { std::fprintf(stderr, "usage: c4d decode <archive.c4d> <raw_volume>\n"); return 2; }
+    auto file = read_file(argv[2]);
+    archive::Reader r(file);
+    size_t mi = r.find("intensity");
+    if (mi == SIZE_MAX) { std::fprintf(stderr, "no intensity member\n"); return 1; }
+    const archive::Member& m = r.member(mi);
+    Coord3 shape = m.shape, g = chunk_grid(shape);
+    std::vector<u8> vol(shape.z * shape.y * shape.x, 0);
+    std::vector<u8> cube(CHUNK_VOX);
+    for (u64 ci = 0; ci < m.index.size(); ++ci) {
+        Coord3 c = chunk_unravel(ci, g);
+        auto p = r.chunk_payload(mi, ci);
+        if (p.empty()) std::fill(cube.begin(), cube.end(), u8(0));
+        else { auto pl = chunk::Payload::deserialize(p); chunk::decode_chunk(pl, cube); }
+        u64 z0 = c.z * CHUNK, y0 = c.y * CHUNK, x0 = c.x * CHUNK;
+        for (u32 dz = 0; dz < CHUNK && z0 + dz < shape.z; ++dz)
+            for (u32 dy = 0; dy < CHUNK && y0 + dy < shape.y; ++dy) {
+                u64 dst = ((z0 + dz) * shape.y + (y0 + dy)) * shape.x + x0;
+                u32 w = static_cast<u32>(std::min<u64>(CHUNK, shape.x - x0));
+                std::memcpy(&vol[dst], &cube[vox_index(dz, dy, 0)], w);
+            }
+    }
+    write_file(argv[3], vol);
+    std::fprintf(stderr, "decoded %s -> %s (%zu bytes)\n", argv[2], argv[3], vol.size());
+    return 0;
+}
+
+static int info(int argc, char** argv) {
+    if (argc < 3) { std::fprintf(stderr, "usage: c4d info <archive.c4d>\n"); return 2; }
+    auto file = read_file(argv[2]);
+    archive::Reader r(file);
+    std::printf("c4d archive: %zu bytes, %zu member(s)\n", file.size(), r.member_count());
+    for (size_t i = 0; i < r.member_count(); ++i) {
+        const auto& m = r.member(i);
+        u64 absent = 0, stored = 0;
+        for (auto& e : m.index) (e.flags & archive::IndexEntry::ABSENT) ? ++absent : ++stored;
+        std::printf("  [%zu] %-12s type=%u shape=%llux%llux%llu chunks=%zu (stored=%llu absent=%llu)\n",
+                    i, m.name.c_str(), unsigned(m.type),
+                    (unsigned long long)m.shape.z, (unsigned long long)m.shape.y,
+                    (unsigned long long)m.shape.x, m.index.size(),
+                    (unsigned long long)stored, (unsigned long long)absent);
+    }
+    std::printf("  metadata: %.*s\n", int(r.metadata().size()), r.metadata().data());
+    return 0;
+}
+
 static int usage() {
     std::fprintf(stderr,
         "c4d — compress4d archive tool\n"
@@ -82,10 +198,12 @@ static int usage() {
 int main(int argc, char** argv) {
     if (argc < 2) return usage();
     std::string_view cmd = argv[1];
-    if (cmd == "bench") return bench(argc, argv);
-    if (cmd == "info" || cmd == "encode" || cmd == "decode" || cmd == "compact") {
-        std::fprintf(stderr, "c4d %.*s: not yet implemented (archive container pending)\n",
-                     static_cast<int>(cmd.size()), cmd.data());
+    if (cmd == "bench")  return bench(argc, argv);
+    if (cmd == "encode") return encode(argc, argv);
+    if (cmd == "decode") return decode(argc, argv);
+    if (cmd == "info")   return info(argc, argv);
+    if (cmd == "compact") {
+        std::fprintf(stderr, "c4d compact: not yet implemented\n");
         return 1;
     }
     return usage();
