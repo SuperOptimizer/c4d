@@ -19,118 +19,100 @@
 
 namespace c4d::dwt {
 
-// In-place 1D forward 9/7 lifting on a strided line of length n (n even).
-// Whole-sample symmetric extension: index reflection x[-1]=x[1], x[n]=x[n-2]
-// (mirror about the boundary sample). After lifting, even indices hold the
-// low band, odd indices the high band (deinterleaving is done by the caller's
-// pyramid packing — here we keep the in-place interleaved form).
+// One forward lifting step over a CONTIGUOUS line `v` of length n (n even):
+// `c * (left + right)` accumulated into the target parity. The interior runs
+// branch-free; only the two boundary samples consult the mirror (x[-1]=x[1],
+// x[n]=x[n-2], whole-sample symmetric). `odd` selects which parity is updated.
+template <bool ODD>
+inline void lift_pass(f32* __restrict v, u32 n, f64 c) noexcept {
+    const u32 start = ODD ? 1u : 0u;
+    // boundary-aware first/last targets; interior is branch-free.
+    if constexpr (ODD) {
+        // odd targets: i=1..n-1 step 2; neighbors i-1,i+1 always in range for
+        // i<=n-3; the last odd index n-1 needs the mirror (i+1 == n -> n-2).
+        for (u32 i = 1; i + 1 < n; i += 2)
+            v[i] += static_cast<f32>(c * (f64(v[i - 1]) + v[i + 1]));
+        u32 last = n - 1;  // odd (n even)
+        v[last] += static_cast<f32>(c * (f64(v[last - 1]) + v[last - 1]));  // mirror
+    } else {
+        // even targets: i=0..n-2 step 2; i=0 needs mirror (i-1 == -1 -> 1).
+        v[0] += static_cast<f32>(c * (f64(v[1]) + v[1]));                   // mirror
+        for (u32 i = 2; i < n; i += 2)
+            v[i] += static_cast<f32>(c * (f64(v[i - 1]) + v[i + 1]));
+    }
+    (void)start;
+}
+
+// Forward 1D 9/7 lifting on a strided line, packing the result directly into
+// the Mallat halves: gather strided -> lift branch-free in contiguous scratch
+// -> scatter the even (low) samples to the first half and odd (high) to the
+// second half of the strided output. One strided read + one strided write per
+// axis (the separate deinterleave pass is folded in here).
 inline void fwd_1d(f32* p, u32 n, u32 stride) noexcept {
-    auto at = [&](i64 i) -> f32& {
-        // mirror about endpoints (whole-sample symmetric): reflect into [0,n-1].
-        if (i < 0) i = -i;
-        if (i >= static_cast<i64>(n)) i = 2 * (static_cast<i64>(n) - 1) - i;
-        return p[static_cast<u32>(i) * stride];
-    };
-    const f64 a = ALPHA, b = BETA, g = GAMMA, d = DELTA, k = KAPPA;
-    // predict 1 (odd += a*(even neighbors))
-    for (i64 i = 1; i < n; i += 2) at(i) += static_cast<f32>(a * (at(i - 1) + at(i + 1)));
-    // update 1 (even += b*(odd neighbors))
-    for (i64 i = 0; i < n; i += 2) at(i) += static_cast<f32>(b * (at(i - 1) + at(i + 1)));
-    // predict 2
-    for (i64 i = 1; i < n; i += 2) at(i) += static_cast<f32>(g * (at(i - 1) + at(i + 1)));
-    // update 2
-    for (i64 i = 0; i < n; i += 2) at(i) += static_cast<f32>(d * (at(i - 1) + at(i + 1)));
-    // scale: even (low) *= 1/k, odd (high) *= k
-    for (u32 i = 0; i < n; i += 2) p[i * stride] = static_cast<f32>(p[i * stride] * (1.0 / k));
-    for (u32 i = 1; i < n; i += 2) p[i * stride] = static_cast<f32>(p[i * stride] * k);
+    f32 v[CHUNK];
+    for (u32 i = 0; i < n; ++i) v[i] = p[i * stride];
+    lift_pass<true >(v, n, ALPHA);
+    lift_pass<false>(v, n, BETA);
+    lift_pass<true >(v, n, GAMMA);
+    lift_pass<false>(v, n, DELTA);
+    const f32 lo = static_cast<f32>(1.0 / KAPPA), hi = static_cast<f32>(KAPPA);
+    const u32 h = n / 2;
+    for (u32 i = 0; i < h; ++i) {
+        p[i * stride]       = v[2 * i]     * lo;   // low band -> first half
+        p[(h + i) * stride] = v[2 * i + 1] * hi;   // high band -> second half
+    }
 }
 
-// In-place 1D inverse 9/7 lifting — exact reverse of fwd_1d.
+// Inverse 1D 9/7 lifting — exact reverse of fwd_1d, including the interleave:
+// gather the two Mallat halves back into interleaved order, undo scale, undo
+// the four lifts, scatter back.
 inline void inv_1d(f32* p, u32 n, u32 stride) noexcept {
-    auto at = [&](i64 i) -> f32& {
-        if (i < 0) i = -i;
-        if (i >= static_cast<i64>(n)) i = 2 * (static_cast<i64>(n) - 1) - i;
-        return p[static_cast<u32>(i) * stride];
-    };
-    const f64 a = ALPHA, b = BETA, g = GAMMA, d = DELTA, k = KAPPA;
-    // undo scale
-    for (u32 i = 0; i < n; i += 2) p[i * stride] = static_cast<f32>(p[i * stride] * k);
-    for (u32 i = 1; i < n; i += 2) p[i * stride] = static_cast<f32>(p[i * stride] * (1.0 / k));
-    // undo update 2
-    for (i64 i = 0; i < n; i += 2) at(i) -= static_cast<f32>(d * (at(i - 1) + at(i + 1)));
-    // undo predict 2
-    for (i64 i = 1; i < n; i += 2) at(i) -= static_cast<f32>(g * (at(i - 1) + at(i + 1)));
-    // undo update 1
-    for (i64 i = 0; i < n; i += 2) at(i) -= static_cast<f32>(b * (at(i - 1) + at(i + 1)));
-    // undo predict 1
-    for (i64 i = 1; i < n; i += 2) at(i) -= static_cast<f32>(a * (at(i - 1) + at(i + 1)));
-}
-
-// After an in-place interleaved lifting pass over a line of length n, separate
-// the low (even) and high (odd) samples into the contiguous Mallat halves:
-// [low(0..n/2) | high(0..n/2)]. Inverse interleaves them back.
-inline void deinterleave(f32* p, u32 n, u32 stride, f32* tmp) noexcept {
+    f32 v[CHUNK];
+    const f32 lo = static_cast<f32>(KAPPA), hi = static_cast<f32>(1.0 / KAPPA);
     const u32 h = n / 2;
-    for (u32 i = 0; i < h; ++i) { tmp[i] = p[(2 * i) * stride]; tmp[h + i] = p[(2 * i + 1) * stride]; }
-    for (u32 i = 0; i < n; ++i) p[i * stride] = tmp[i];
-}
-inline void interleave(f32* p, u32 n, u32 stride, f32* tmp) noexcept {
-    const u32 h = n / 2;
-    for (u32 i = 0; i < h; ++i) { tmp[2 * i] = p[i * stride]; tmp[2 * i + 1] = p[(h + i) * stride]; }
-    for (u32 i = 0; i < n; ++i) p[i * stride] = tmp[i];
+    for (u32 i = 0; i < h; ++i) {
+        v[2 * i]     = p[i * stride]       * lo;   // low half -> even
+        v[2 * i + 1] = p[(h + i) * stride] * hi;   // high half -> odd
+    }
+    lift_pass<false>(v, n, -DELTA);
+    lift_pass<true >(v, n, -GAMMA);
+    lift_pass<false>(v, n, -BETA);
+    lift_pass<true >(v, n, -ALPHA);
+    for (u32 i = 0; i < n; ++i) p[i * stride] = v[i];
 }
 
 // One separable forward DWT step over the leading s^3 sub-cube of a CHUNK^3
 // buffer, transforming all three axes and packing into Mallat octant layout.
+// fwd_1d folds the deinterleave into its scatter, so each axis is one pass.
 inline void fwd_step(f32* vol, u32 s) noexcept {
-    std::array<f32, CHUNK> tmp{};
     // X axis (stride 1)
     for (u32 z = 0; z < s; ++z)
-        for (u32 y = 0; y < s; ++y) {
-            f32* line = vol + (z * CHUNK + y) * CHUNK;
-            fwd_1d(line, s, 1);
-            deinterleave(line, s, 1, tmp.data());
-        }
+        for (u32 y = 0; y < s; ++y)
+            fwd_1d(vol + (z * CHUNK + y) * CHUNK, s, 1);
     // Y axis (stride CHUNK)
     for (u32 z = 0; z < s; ++z)
-        for (u32 x = 0; x < s; ++x) {
-            f32* line = vol + z * CHUNK * CHUNK + x;
-            fwd_1d(line, s, CHUNK);
-            deinterleave(line, s, CHUNK, tmp.data());
-        }
+        for (u32 x = 0; x < s; ++x)
+            fwd_1d(vol + z * CHUNK * CHUNK + x, s, CHUNK);
     // Z axis (stride CHUNK*CHUNK)
     for (u32 y = 0; y < s; ++y)
-        for (u32 x = 0; x < s; ++x) {
-            f32* line = vol + y * CHUNK + x;
-            fwd_1d(line, s, CHUNK * CHUNK);
-            deinterleave(line, s, CHUNK * CHUNK, tmp.data());
-        }
+        for (u32 x = 0; x < s; ++x)
+            fwd_1d(vol + y * CHUNK + x, s, CHUNK * CHUNK);
 }
 
 // One separable inverse DWT step (exact reverse of fwd_step).
 inline void inv_step(f32* vol, u32 s) noexcept {
-    std::array<f32, CHUNK> tmp{};
     // Z axis
     for (u32 y = 0; y < s; ++y)
-        for (u32 x = 0; x < s; ++x) {
-            f32* line = vol + y * CHUNK + x;
-            interleave(line, s, CHUNK * CHUNK, tmp.data());
-            inv_1d(line, s, CHUNK * CHUNK);
-        }
+        for (u32 x = 0; x < s; ++x)
+            inv_1d(vol + y * CHUNK + x, s, CHUNK * CHUNK);
     // Y axis
     for (u32 z = 0; z < s; ++z)
-        for (u32 x = 0; x < s; ++x) {
-            f32* line = vol + z * CHUNK * CHUNK + x;
-            interleave(line, s, CHUNK, tmp.data());
-            inv_1d(line, s, CHUNK);
-        }
-    // X axis
+        for (u32 x = 0; x < s; ++x)
+            inv_1d(vol + z * CHUNK * CHUNK + x, s, CHUNK);
+    // X axis (stride 1)
     for (u32 z = 0; z < s; ++z)
-        for (u32 y = 0; y < s; ++y) {
-            f32* line = vol + (z * CHUNK + y) * CHUNK;
-            interleave(line, s, 1, tmp.data());
-            inv_1d(line, s, 1);
-        }
+        for (u32 y = 0; y < s; ++y)
+            inv_1d(vol + (z * CHUNK + y) * CHUNK, s, 1);
 }
 
 // Full multi-level forward transform over a CHUNK^3 buffer. Each level halves
