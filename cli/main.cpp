@@ -35,11 +35,12 @@ static f64 psnr_u8(std::span<const u8> a, std::span<const u8> b) {
 
 static int bench(int argc, char** argv) {
     if (argc < 3) { std::fprintf(stderr, "usage: c4d bench <dir-of-raw-chunks> [--denoise] [q1 q2 ...]\n"); return 2; }
-    bool denoise = false;
+    bool denoise = false; f32 tol = 0;
     std::vector<f32> qs;
     for (int i = 3; i < argc; ++i) {
         std::string_view a = argv[i];
         if (a == "--denoise") denoise = true;
+        else if (a == "--tolerance" && i + 1 < argc) tol = std::strtof(argv[++i], nullptr);
         else qs.push_back(std::strtof(argv[i], nullptr));
     }
     if (qs.empty()) qs = {4, 8, 16, 32, 64};
@@ -58,7 +59,7 @@ static int bench(int argc, char** argv) {
         for (auto& f : files) {
             auto vox = read_file(f);
             if (vox.size() != CHUNK_VOX) continue;
-            chunk::EncodeOpts opt{.q = q, .noise_aware = denoise};
+            chunk::EncodeOpts opt{.q = q, .noise_aware = denoise, .tolerance = tol};
             auto pl = chunk::encode_chunk(vox, opt);
             auto blob = pl.serialize();
             std::vector<u8> rec(CHUNK_VOX);

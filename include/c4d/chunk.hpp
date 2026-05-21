@@ -19,6 +19,7 @@
 #include "rans.hpp"
 #include "hybrid_uint.hpp"
 #include "scan.hpp"
+#include "outlier.hpp"
 #include <span>
 #include <vector>
 
@@ -55,8 +56,10 @@ struct Payload {
     f32 dc = 0;                 // subtracted mean
     f32 q = 0;                  // the global q knob (record-keeping / per-chunk field)
     StepTable steps{};          // per-subband steps the decoder dequantizes with
+    f32 tolerance = 0;          // outlier-pass L-inf tolerance t (0 => no pass)
     std::vector<u8> tokens;     // rANS symbol stream
     std::vector<u8> bypass;     // raw mantissa + sign + run bits
+    std::vector<u8> outliers;   // optional sparse correction stream (§4.6)
     // Serialized form is produced by serialize(); the archive stores that blob.
     std::vector<u8> serialize() const;
     static Payload deserialize(std::span<const u8> bytes);
@@ -86,6 +89,8 @@ struct TokenStream {
     }
 };
 
+inline void decode_chunk(const Payload& p, std::span<u8> out);  // fwd decl
+
 // Encoder options. The decoder reads steps from the stream regardless, so these
 // only affect the encoder's step-table choice (§4.10) — never the bitstream
 // shape or the decoder.
@@ -93,6 +98,7 @@ struct EncodeOpts {
     f32 q = 16.f;                 // global quality knob (base step scale)
     bool noise_aware = false;     // MAD + BayesShrink dead-zone (§4.10)
     f64 shrink_strength = 1.0;    // 0..1, how aggressively to apply shrinkage
+    f32 tolerance = 0;            // outlier pass: hard L-inf bound t (0 => off, §4.6)
 };
 
 // Encode one 128^3 u8 chunk. `vox` is row-major Z,Y,X.
@@ -139,11 +145,22 @@ inline Payload encode_chunk(std::span<const u8> vox, const EncodeOpts& opt) {
     p.dc = static_cast<f32>(mean);
     p.q  = opt.q;
     p.steps = steps;
+    p.tolerance = opt.tolerance;
     // tokens blob = [freq table | token count | rans bytes]
     tbl.serialize(p.tokens);
     for (int i = 0; i < 4; ++i) p.tokens.push_back(u8((u32(ts.toks.size()) >> (8 * i)) & 0xff));
     p.tokens.insert(p.tokens.end(), rans_bytes.begin(), rans_bytes.end());
     p.bypass = ts.bypass.finish();
+
+    // Outlier pass (§4.6): internally decode the coefficient stream we just
+    // built, find voxels outside the L-inf tolerance, and code the sparse
+    // corrections as a second stream. Decode is unaffected beyond applying them.
+    if (opt.tolerance > 0) {
+        std::vector<u8> recon(CHUNK_VOX);
+        decode_chunk(p, recon);                        // recon WITHOUT corrections yet
+        auto cs = outlier::find(vox, recon, opt.tolerance);
+        p.outliers = outlier::encode(cs);
+    }
     return p;
 }
 
@@ -192,6 +209,10 @@ inline void decode_chunk(const Payload& p, std::span<u8> out) {
         f32 v = coef[i] + p.dc;
         out[i] = static_cast<u8>(v < 0.f ? 0.f : (v > 255.f ? 255.f : v + 0.5f));
     }
+
+    // Apply the optional outlier corrections (§4.6) -> hard |z - x| <= t.
+    if (p.tolerance > 0 && !p.outliers.empty())
+        outlier::apply(p.outliers, p.tolerance, out);
 }
 
 // --- payload serialization (flat blob for the archive) ---------------------
@@ -199,14 +220,16 @@ inline std::vector<u8> Payload::serialize() const {
     std::vector<u8> b;
     auto push32 = [&](u32 v) { for (int i = 0; i < 4; ++i) b.push_back(u8((v >> (8 * i)) & 0xff)); };
     auto pushf  = [&](f32 f) { u32 v; std::memcpy(&v, &f, 4); push32(v); };
-    pushf(dc); pushf(q);
+    pushf(dc); pushf(q); pushf(tolerance);
     // per-subband step table (decoder reads these, §4.1)
     for (u32 l = 0; l < DWT_LEVELS; ++l)
         for (u32 o = 0; o < 8; ++o) pushf(steps.step[l][o]);
     push32(static_cast<u32>(tokens.size()));
     push32(static_cast<u32>(bypass.size()));
+    push32(static_cast<u32>(outliers.size()));
     b.insert(b.end(), tokens.begin(), tokens.end());
     b.insert(b.end(), bypass.begin(), bypass.end());
+    b.insert(b.end(), outliers.begin(), outliers.end());
     return b;
 }
 
@@ -214,12 +237,13 @@ inline Payload Payload::deserialize(std::span<const u8> bytes) {
     Payload p; size_t pos = 0;
     auto rd32 = [&] { u32 v = 0; for (int i = 0; i < 4; ++i) v |= u32(bytes[pos++]) << (8 * i); return v; };
     auto rdf  = [&] { u32 v = rd32(); f32 f; std::memcpy(&f, &v, 4); return f; };
-    p.dc = rdf(); p.q = rdf();
+    p.dc = rdf(); p.q = rdf(); p.tolerance = rdf();
     for (u32 l = 0; l < DWT_LEVELS; ++l)
         for (u32 o = 0; o < 8; ++o) p.steps.step[l][o] = rdf();
-    u32 tlen = rd32(), blen = rd32();
+    u32 tlen = rd32(), blen = rd32(), olen = rd32();
     p.tokens.assign(bytes.begin() + pos, bytes.begin() + pos + tlen); pos += tlen;
     p.bypass.assign(bytes.begin() + pos, bytes.begin() + pos + blen); pos += blen;
+    p.outliers.assign(bytes.begin() + pos, bytes.begin() + pos + olen); pos += olen;
     return p;
 }
 
