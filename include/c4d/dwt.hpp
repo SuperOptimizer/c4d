@@ -16,6 +16,11 @@
 #include <array>
 #include <cstring>
 #include <vector>
+#if __has_include(<experimental/simd>)
+#  include <experimental/simd>
+#  define C4D_HAVE_SIMD 1
+namespace c4d::dwt { namespace stdx = std::experimental; }
+#endif
 
 namespace c4d::dwt {
 
@@ -63,6 +68,61 @@ inline void fwd_1d(f32* p, u32 n, u32 stride) noexcept {
     }
 }
 
+#ifdef C4D_HAVE_SIMD
+// --- SIMD multi-line lifting (§4.9) ----------------------------------------
+// Process W parallel lines at once, one SIMD lane per line. The W lines are W
+// consecutive innermost-x positions (lane_stride 1 => contiguous loads), each
+// line stepping by `stride` along the transform axis. Used for the Y and Z
+// passes where the scalar strided gather/scatter dominated. Bit-for-bit
+// equivalent to running fwd_1d/inv_1d on each of the W lines (modulo f32
+// associativity, which -ffast-math already permits).
+using vf = stdx::native_simd<f32>;
+inline constexpr u32 VW = vf::size();
+
+template <bool ODD>
+inline void lift_pass_v(vf* __restrict v, u32 n, f32 c) noexcept {
+    if constexpr (ODD) {
+        for (u32 i = 1; i + 1 < n; i += 2) v[i] += c * (v[i - 1] + v[i + 1]);
+        u32 last = n - 1;
+        v[last] += c * (v[last - 1] + v[last - 1]);          // mirror
+    } else {
+        v[0] += c * (v[1] + v[1]);                           // mirror
+        for (u32 i = 2; i < n; i += 2) v[i] += c * (v[i - 1] + v[i + 1]);
+    }
+}
+
+// Forward lifting of VW lines starting at `base`, axis stride `stride`.
+inline void fwd_1d_v(f32* base, u32 n, u32 stride) noexcept {
+    vf v[CHUNK];
+    for (u32 i = 0; i < n; ++i) v[i] = vf(&base[i * stride], stdx::element_aligned);
+    lift_pass_v<true >(v, n, f32(ALPHA));
+    lift_pass_v<false>(v, n, f32(BETA));
+    lift_pass_v<true >(v, n, f32(GAMMA));
+    lift_pass_v<false>(v, n, f32(DELTA));
+    const f32 lo = f32(1.0 / KAPPA), hi = f32(KAPPA);
+    const u32 h = n / 2;
+    for (u32 i = 0; i < h; ++i) {
+        (v[2 * i]     * lo).copy_to(&base[i * stride],       stdx::element_aligned);
+        (v[2 * i + 1] * hi).copy_to(&base[(h + i) * stride], stdx::element_aligned);
+    }
+}
+
+inline void inv_1d_v(f32* base, u32 n, u32 stride) noexcept {
+    vf v[CHUNK];
+    const f32 lo = f32(KAPPA), hi = f32(1.0 / KAPPA);
+    const u32 h = n / 2;
+    for (u32 i = 0; i < h; ++i) {
+        v[2 * i]     = vf(&base[i * stride],       stdx::element_aligned) * lo;
+        v[2 * i + 1] = vf(&base[(h + i) * stride], stdx::element_aligned) * hi;
+    }
+    lift_pass_v<false>(v, n, f32(-DELTA));
+    lift_pass_v<true >(v, n, f32(-GAMMA));
+    lift_pass_v<false>(v, n, f32(-BETA));
+    lift_pass_v<true >(v, n, f32(-ALPHA));
+    for (u32 i = 0; i < n; ++i) v[i].copy_to(&base[i * stride], stdx::element_aligned);
+}
+#endif
+
 // Inverse 1D 9/7 lifting — exact reverse of fwd_1d, including the interleave:
 // gather the two Mallat halves back into interleaved order, undo scale, undo
 // the four lifts, scatter back.
@@ -85,30 +145,46 @@ inline void inv_1d(f32* p, u32 n, u32 stride) noexcept {
 // buffer, transforming all three axes and packing into Mallat octant layout.
 // fwd_1d folds the deinterleave into its scatter, so each axis is one pass.
 inline void fwd_step(f32* vol, u32 s) noexcept {
-    // X axis (stride 1)
+    // X axis (stride 1): contiguous lines, scalar gather is already cache-good.
     for (u32 z = 0; z < s; ++z)
         for (u32 y = 0; y < s; ++y)
             fwd_1d(vol + (z * CHUNK + y) * CHUNK, s, 1);
-    // Y axis (stride CHUNK)
-    for (u32 z = 0; z < s; ++z)
-        for (u32 x = 0; x < s; ++x)
-            fwd_1d(vol + z * CHUNK * CHUNK + x, s, CHUNK);
-    // Z axis (stride CHUNK*CHUNK)
-    for (u32 y = 0; y < s; ++y)
-        for (u32 x = 0; x < s; ++x)
-            fwd_1d(vol + y * CHUNK + x, s, CHUNK * CHUNK);
+    // Y axis (stride CHUNK): VW consecutive x per SIMD pass (contiguous loads),
+    // scalar remainder. Z axis (stride CHUNK^2) likewise.
+#ifdef C4D_HAVE_SIMD
+    for (u32 z = 0; z < s; ++z) {
+        u32 x = 0;
+        for (; x + VW <= s; x += VW) fwd_1d_v(vol + z * CHUNK * CHUNK + x, s, CHUNK);
+        for (; x < s; ++x)           fwd_1d  (vol + z * CHUNK * CHUNK + x, s, CHUNK);
+    }
+    for (u32 y = 0; y < s; ++y) {
+        u32 x = 0;
+        for (; x + VW <= s; x += VW) fwd_1d_v(vol + y * CHUNK + x, s, CHUNK * CHUNK);
+        for (; x < s; ++x)           fwd_1d  (vol + y * CHUNK + x, s, CHUNK * CHUNK);
+    }
+#else
+    for (u32 z = 0; z < s; ++z) for (u32 x = 0; x < s; ++x) fwd_1d(vol + z*CHUNK*CHUNK + x, s, CHUNK);
+    for (u32 y = 0; y < s; ++y) for (u32 x = 0; x < s; ++x) fwd_1d(vol + y*CHUNK + x, s, CHUNK*CHUNK);
+#endif
 }
 
 // One separable inverse DWT step (exact reverse of fwd_step).
 inline void inv_step(f32* vol, u32 s) noexcept {
-    // Z axis
-    for (u32 y = 0; y < s; ++y)
-        for (u32 x = 0; x < s; ++x)
-            inv_1d(vol + y * CHUNK + x, s, CHUNK * CHUNK);
-    // Y axis
-    for (u32 z = 0; z < s; ++z)
-        for (u32 x = 0; x < s; ++x)
-            inv_1d(vol + z * CHUNK * CHUNK + x, s, CHUNK);
+#ifdef C4D_HAVE_SIMD
+    for (u32 y = 0; y < s; ++y) {
+        u32 x = 0;
+        for (; x + VW <= s; x += VW) inv_1d_v(vol + y * CHUNK + x, s, CHUNK * CHUNK);
+        for (; x < s; ++x)           inv_1d  (vol + y * CHUNK + x, s, CHUNK * CHUNK);
+    }
+    for (u32 z = 0; z < s; ++z) {
+        u32 x = 0;
+        for (; x + VW <= s; x += VW) inv_1d_v(vol + z * CHUNK * CHUNK + x, s, CHUNK);
+        for (; x < s; ++x)           inv_1d  (vol + z * CHUNK * CHUNK + x, s, CHUNK);
+    }
+#else
+    for (u32 y = 0; y < s; ++y) for (u32 x = 0; x < s; ++x) inv_1d(vol + y*CHUNK + x, s, CHUNK*CHUNK);
+    for (u32 z = 0; z < s; ++z) for (u32 x = 0; x < s; ++x) inv_1d(vol + z*CHUNK*CHUNK + x, s, CHUNK);
+#endif
     // X axis (stride 1)
     for (u32 z = 0; z < s; ++z)
         for (u32 y = 0; y < s; ++y)
