@@ -13,6 +13,10 @@
 #include <array>
 #include <cmath>
 #include <span>
+#if __has_include(<experimental/simd>)
+#  include <experimental/simd>
+#  define C4D_QUANT_SIMD 1
+#endif
 
 namespace c4d {
 
@@ -74,20 +78,71 @@ struct SubbandMap {
     return m;
 }
 
+// Per-voxel quantizer step for the current StepTable, materialized into a flat
+// array so the dead-zone loop is a contiguous SIMD pass (no per-voxel table
+// indirection). The subband id per voxel is fixed geometry; only the 40 step
+// values change per chunk, so this fill is cheap.
+inline void build_step_field(const StepTable& t, std::span<f32> field) noexcept {
+    const SubbandMap& m = subband_map();
+    // flatten the (level,orient) table to a 256-entry lookup keyed by the id byte
+    std::array<f32, 256> lut{};
+    for (u32 l = 0; l < DWT_LEVELS; ++l)
+        for (u32 o = 0; o < 8; ++o) lut[(l << 3) | o] = t.step[l][o];
+    for (u32 i = 0; i < CHUNK_VOX; ++i) field[i] = lut[m.id[i]];
+}
+
 // Quantize a whole transformed cube into integer levels using the step table.
 inline void quantize(std::span<const f32> coeffs, const StepTable& t,
                      std::span<i32> out) noexcept {
-    const SubbandMap& m = subband_map();
-    for (u32 i = 0; i < CHUNK_VOX; ++i)
-        out[i] = dead_zone_quantize(coeffs[i], t.step[m.level(i)][m.orient(i)]);
+    std::vector<f32> step(CHUNK_VOX);
+    build_step_field(t, step);
+#ifdef C4D_QUANT_SIMD
+    // Work entirely in the float domain (masks are native to vf), produce a
+    // signed float level, then one cast to int. Matches dead_zone_quantize.
+    namespace stdx = std::experimental;
+    using vf = stdx::native_simd<f32>;
+    using vi = stdx::rebind_simd_t<i32, vf>;
+    constexpr u32 W = vf::size();
+    u32 i = 0;
+    for (; i + W <= CHUNK_VOX; i += W) {
+        vf c(&coeffs[i], stdx::element_aligned);
+        vf s(&step[i],   stdx::element_aligned);
+        vf a = stdx::abs(c);
+        vf mag = stdx::floor(a / s - 0.5f) + 1.0f;          // |level|
+        vf sgn = vf(1.0f);
+        where(c < 0.f, sgn) = -1.0f;
+        vf qf = mag * sgn;
+        where((a < 0.5f * s) || (s <= 0.f), qf) = 0.0f;     // dead zone / no step
+        vi q = stdx::static_simd_cast<vi>(qf);
+        q.copy_to(&out[i], stdx::element_aligned);
+    }
+    for (; i < CHUNK_VOX; ++i) out[i] = dead_zone_quantize(coeffs[i], step[i]);
+#else
+    for (u32 i = 0; i < CHUNK_VOX; ++i) out[i] = dead_zone_quantize(coeffs[i], step[i]);
+#endif
 }
 
-// Dequantize integer levels back to coefficients.
+// Dequantize integer levels back to coefficients (out = q * step, mid-tread).
 inline void dequantize(std::span<const i32> q, const StepTable& t,
                        std::span<f32> out) noexcept {
-    const SubbandMap& m = subband_map();
-    for (u32 i = 0; i < CHUNK_VOX; ++i)
-        out[i] = dead_zone_dequantize(q[i], t.step[m.level(i)][m.orient(i)]);
+    std::vector<f32> step(CHUNK_VOX);
+    build_step_field(t, step);
+#ifdef C4D_QUANT_SIMD
+    namespace stdx = std::experimental;
+    using vf = stdx::native_simd<f32>;
+    using vi = stdx::rebind_simd_t<i32, vf>;
+    constexpr u32 W = vf::size();
+    u32 i = 0;
+    for (; i + W <= CHUNK_VOX; i += W) {
+        vi qi(&q[i], stdx::element_aligned);
+        vf qf = stdx::static_simd_cast<vf>(qi);
+        vf s(&step[i], stdx::element_aligned);
+        (qf * s).copy_to(&out[i], stdx::element_aligned);    // 0*s = 0, sign preserved
+    }
+    for (; i < CHUNK_VOX; ++i) out[i] = dead_zone_dequantize(q[i], step[i]);
+#else
+    for (u32 i = 0; i < CHUNK_VOX; ++i) out[i] = dead_zone_dequantize(q[i], step[i]);
+#endif
 }
 
 } // namespace c4d
