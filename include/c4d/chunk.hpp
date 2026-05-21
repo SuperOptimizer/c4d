@@ -17,6 +17,7 @@
 #include "quant.hpp"
 #include "rans.hpp"
 #include "hybrid_uint.hpp"
+#include "scan.hpp"
 #include <span>
 #include <vector>
 
@@ -93,24 +94,12 @@ inline Payload encode_chunk(std::span<const u8> vox, f32 q) {
     std::vector<i32> ql(CHUNK_VOX);
     quantize(coef, steps, ql);
 
-    // 4. model-the-zeros token generation, in subband order (block-aligned).
-    // For T0 we scan in the natural index order grouped by subband id so that
-    // runs of zeros within dead HF bands coalesce. (Frequency-diagonal scan is a
-    // T1 refinement that lengthens runs further.)
+    // 4. model-the-zeros token generation (§4.7). Coefficients are visited in
+    // the canonical scan order (subband-contiguous, raster within band) so the
+    // dead-zone zeros form long runs the zero-run/EOB tokens collapse cheaply.
+    // (Frequency-diagonal within-band order measured worse here — see scan.hpp.)
     TokenStream ts;
-    const SubbandMap& m = subband_map();
-    // Visit coefficients ordered by subband id, then linear index — keeps each
-    // band's coefficients contiguous so zero runs don't break at band edges.
-    // Precompute a stable order: bucket indices by subband id.
-    static const std::vector<u32> order = [] {
-        std::vector<u32> ord(CHUNK_VOX);
-        const SubbandMap& mm = subband_map();
-        std::vector<std::vector<u32>> buckets(256);
-        for (u32 i = 0; i < CHUNK_VOX; ++i) buckets[mm.id[i]].push_back(i);
-        u32 k = 0;
-        for (auto& b : buckets) for (u32 i : b) ord[k++] = i;
-        return ord;
-    }();
+    const std::vector<u32>& order = scan_order().order;
 
     u32 zeros = 0;
     for (u32 idx : order) {
@@ -148,15 +137,8 @@ inline void decode_chunk(const Payload& p, std::span<u8> out) {
     rans::Decoder dec(rans_bytes);
     rans::BitReader br(p.bypass);
 
-    // Reconstruct quantized levels in the same subband order, then scatter.
-    static const std::vector<u32> order = [] {
-        std::vector<u32> ord(CHUNK_VOX);
-        const SubbandMap& mm = subband_map();
-        std::vector<std::vector<u32>> buckets(256);
-        for (u32 i = 0; i < CHUNK_VOX; ++i) buckets[mm.id[i]].push_back(i);
-        u32 k = 0; for (auto& b : buckets) for (u32 i : b) ord[k++] = i;
-        return ord;
-    }();
+    // Reconstruct quantized levels in the same canonical scan order, then scatter.
+    const std::vector<u32>& order = scan_order().order;
 
     std::vector<i32> ql(CHUNK_VOX, 0);
     u32 oi = 0;  // position in `order`
