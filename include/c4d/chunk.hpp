@@ -15,6 +15,7 @@
 #include "core.hpp"
 #include "dwt.hpp"
 #include "quant.hpp"
+#include "denoise.hpp"
 #include "rans.hpp"
 #include "hybrid_uint.hpp"
 #include "scan.hpp"
@@ -46,16 +47,20 @@ struct RunSplit { u32 token; u32 raw; u32 nbits; };
 }
 
 // A decoded/encodable chunk payload: the entropy bytes plus the small header
-// the decoder needs (q knob -> step table is rebuilt; mean DC; stream sizes).
+// the decoder needs. Per §4.1 the decoder READS the per-subband quantizer steps
+// from the chunk (never recomputes them), so the encoder's step policy — global
+// q, noise-aware shrinkage, future RDO — is not baked into the format. The full
+// StepTable (DWT_LEVELS*8 floats) rides in the payload header.
 struct Payload {
     f32 dc = 0;                 // subtracted mean
-    f32 q = 0;                  // quality knob used (-> StepTable::from_q)
+    f32 q = 0;                  // the global q knob (record-keeping / per-chunk field)
+    StepTable steps{};          // per-subband steps the decoder dequantizes with
     std::vector<u8> tokens;     // rANS symbol stream
     std::vector<u8> bypass;     // raw mantissa + sign + run bits
     // Serialized form is produced by serialize(); the archive stores that blob.
     std::vector<u8> serialize() const;
     static Payload deserialize(std::span<const u8> bytes);
-    size_t size_bytes() const { return tokens.size() + bypass.size() + 16; }
+    size_t size_bytes() const { return tokens.size() + bypass.size() + 16 + sizeof(StepTable); }
 };
 
 // --- token-stream generation (encode) --------------------------------------
@@ -81,16 +86,30 @@ struct TokenStream {
     }
 };
 
-// Encode one 128^3 u8 chunk at quality knob q. `vox` is row-major Z,Y,X.
-inline Payload encode_chunk(std::span<const u8> vox, f32 q) {
+// Encoder options. The decoder reads steps from the stream regardless, so these
+// only affect the encoder's step-table choice (§4.10) — never the bitstream
+// shape or the decoder.
+struct EncodeOpts {
+    f32 q = 16.f;                 // global quality knob (base step scale)
+    bool noise_aware = false;     // MAD + BayesShrink dead-zone (§4.10)
+    f64 shrink_strength = 1.0;    // 0..1, how aggressively to apply shrinkage
+};
+
+// Encode one 128^3 u8 chunk. `vox` is row-major Z,Y,X.
+inline Payload encode_chunk(std::span<const u8> vox, const EncodeOpts& opt) {
     // 1. to float, subtract DC (mean)
     std::vector<f32> coef(CHUNK_VOX);
     f64 mean = 0; for (u8 v : vox) mean += v; mean /= CHUNK_VOX;
     for (u32 i = 0; i < CHUNK_VOX; ++i) coef[i] = static_cast<f32>(vox[i]) - static_cast<f32>(mean);
 
-    // 2. DWT, 3. quantize
+    // 2. DWT
     dwt::forward(coef.data());
-    StepTable steps = StepTable::from_q(q);
+
+    // 3. choose per-subband steps (encoder policy; decoder reads them back).
+    StepTable steps = StepTable::from_q(opt.q);
+    if (opt.noise_aware)
+        steps = NoiseShrink::analyze(coef).apply(steps, opt.shrink_strength);
+
     std::vector<i32> ql(CHUNK_VOX);
     quantize(coef, steps, ql);
 
@@ -118,13 +137,19 @@ inline Payload encode_chunk(std::span<const u8> vox, f32 q) {
 
     Payload p;
     p.dc = static_cast<f32>(mean);
-    p.q  = q;
+    p.q  = opt.q;
+    p.steps = steps;
     // tokens blob = [freq table | token count | rans bytes]
     tbl.serialize(p.tokens);
     for (int i = 0; i < 4; ++i) p.tokens.push_back(u8((u32(ts.toks.size()) >> (8 * i)) & 0xff));
     p.tokens.insert(p.tokens.end(), rans_bytes.begin(), rans_bytes.end());
     p.bypass = ts.bypass.finish();
     return p;
+}
+
+// Convenience overload: encode at a plain global quality knob.
+inline Payload encode_chunk(std::span<const u8> vox, f32 q) {
+    return encode_chunk(vox, EncodeOpts{.q = q});
 }
 
 // Decode one chunk payload back to a 128^3 u8 cube.
@@ -158,10 +183,10 @@ inline void decode_chunk(const Payload& p, std::span<u8> out) {
         }
     }
 
-    // dequantize, inverse DWT, add DC, clamp to u8.
-    StepTable steps = StepTable::from_q(p.q);
+    // dequantize with the steps carried in the chunk (§4.1), inverse DWT, add
+    // DC, clamp to u8.
     std::vector<f32> coef(CHUNK_VOX);
-    dequantize(ql, steps, coef);
+    dequantize(ql, p.steps, coef);
     dwt::inverse(coef.data());
     for (u32 i = 0; i < CHUNK_VOX; ++i) {
         f32 v = coef[i] + p.dc;
@@ -175,6 +200,9 @@ inline std::vector<u8> Payload::serialize() const {
     auto push32 = [&](u32 v) { for (int i = 0; i < 4; ++i) b.push_back(u8((v >> (8 * i)) & 0xff)); };
     auto pushf  = [&](f32 f) { u32 v; std::memcpy(&v, &f, 4); push32(v); };
     pushf(dc); pushf(q);
+    // per-subband step table (decoder reads these, §4.1)
+    for (u32 l = 0; l < DWT_LEVELS; ++l)
+        for (u32 o = 0; o < 8; ++o) pushf(steps.step[l][o]);
     push32(static_cast<u32>(tokens.size()));
     push32(static_cast<u32>(bypass.size()));
     b.insert(b.end(), tokens.begin(), tokens.end());
@@ -187,6 +215,8 @@ inline Payload Payload::deserialize(std::span<const u8> bytes) {
     auto rd32 = [&] { u32 v = 0; for (int i = 0; i < 4; ++i) v |= u32(bytes[pos++]) << (8 * i); return v; };
     auto rdf  = [&] { u32 v = rd32(); f32 f; std::memcpy(&f, &v, 4); return f; };
     p.dc = rdf(); p.q = rdf();
+    for (u32 l = 0; l < DWT_LEVELS; ++l)
+        for (u32 o = 0; o < 8; ++o) p.steps.step[l][o] = rdf();
     u32 tlen = rd32(), blen = rd32();
     p.tokens.assign(bytes.begin() + pos, bytes.begin() + pos + tlen); pos += tlen;
     p.bypass.assign(bytes.begin() + pos, bytes.begin() + pos + blen); pos += blen;

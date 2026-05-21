@@ -76,9 +76,10 @@ int main() {
         bool all_zero = true; for (u8 v : rec) if (v) all_zero = false;
         CHECK(all_zero);
         std::fprintf(stderr, "  all-zero chunk: %zu B\n", blob.size());
-        // Near-empty: a single zero-run token; the bytes are dominated by the
-        // serialized frequency table (88-symbol alphabet), not coefficient data.
-        CHECK(blob.size() < 400);
+        // Near-empty: a single zero-run token. Bytes are fixed overhead — the
+        // serialized freq table (128-symbol alphabet ~256B) + the per-subband
+        // step table (40 floats = 160B) — not coefficient data.
+        CHECK(blob.size() < 512);
     }
 
     RUN_TESTS_RETURN();

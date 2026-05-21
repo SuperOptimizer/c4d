@@ -34,9 +34,14 @@ static f64 psnr_u8(std::span<const u8> a, std::span<const u8> b) {
 }
 
 static int bench(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: c4d bench <dir-of-raw-chunks> [q1 q2 ...]\n"); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: c4d bench <dir-of-raw-chunks> [--denoise] [q1 q2 ...]\n"); return 2; }
+    bool denoise = false;
     std::vector<f32> qs;
-    for (int i = 3; i < argc; ++i) qs.push_back(std::strtof(argv[i], nullptr));
+    for (int i = 3; i < argc; ++i) {
+        std::string_view a = argv[i];
+        if (a == "--denoise") denoise = true;
+        else qs.push_back(std::strtof(argv[i], nullptr));
+    }
     if (qs.empty()) qs = {4, 8, 16, 32, 64};
 
     std::vector<std::string> files;
@@ -45,14 +50,16 @@ static int bench(int argc, char** argv) {
     std::sort(files.begin(), files.end());
     if (files.empty()) { std::fprintf(stderr, "no .raw chunks in %s\n", argv[2]); return 1; }
 
-    std::fprintf(stderr, "corpus: %zu chunks from %s\n\n", files.size(), argv[2]);
+    std::fprintf(stderr, "corpus: %zu chunks from %s%s\n\n", files.size(), argv[2],
+                 denoise ? "  [noise-aware dead-zone]" : "");
     std::printf("%6s  %10s  %10s  %12s\n", "q", "PSNR(dB)", "ratio", "bits/voxel");
     for (f32 q : qs) {
         f64 sum_se = 0; u64 total_bytes = 0; u64 total_vox = 0;
         for (auto& f : files) {
             auto vox = read_file(f);
             if (vox.size() != CHUNK_VOX) continue;
-            auto pl = chunk::encode_chunk(vox, q);
+            chunk::EncodeOpts opt{.q = q, .noise_aware = denoise};
+            auto pl = chunk::encode_chunk(vox, opt);
             auto blob = pl.serialize();
             std::vector<u8> rec(CHUNK_VOX);
             chunk::decode_chunk(pl, rec);
