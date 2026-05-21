@@ -4,6 +4,7 @@
 // metric basket). encode/decode/compact are filled in as the archive lands.
 #include "c4d/chunk.hpp"
 #include "c4d/archive.hpp"
+#include "c4d/metrics.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -53,9 +54,12 @@ static int bench(int argc, char** argv) {
 
     std::fprintf(stderr, "corpus: %zu chunks from %s%s\n\n", files.size(), argv[2],
                  denoise ? "  [noise-aware dead-zone]" : "");
-    std::printf("%6s  %10s  %10s  %12s\n", "q", "PSNR(dB)", "ratio", "bits/voxel");
+    // §7.1 basket: per-metric table across the q sweep x corpus.
+    std::printf("%5s %7s %7s %7s %7s %7s %7s %7s %7s\n",
+                "q", "ratio", "PSNR", "GMSD", "MSSSIM", "HaarPSI", "sharp", "EPI", "geomean");
     for (f32 q : qs) {
-        f64 sum_se = 0; u64 total_bytes = 0; u64 total_vox = 0;
+        u64 total_bytes = 0, total_vox = 0, nc = 0;
+        f64 sp = 0, sg = 0, sm = 0, sh = 0, ss = 0, se = 0, sgeo = 0;
         for (auto& f : files) {
             auto vox = read_file(f);
             if (vox.size() != CHUNK_VOX) continue;
@@ -64,14 +68,14 @@ static int bench(int argc, char** argv) {
             auto blob = pl.serialize();
             std::vector<u8> rec(CHUNK_VOX);
             chunk::decode_chunk(pl, rec);
-            for (u32 i = 0; i < CHUNK_VOX; ++i) { f64 d = f64(vox[i]) - rec[i]; sum_se += d * d; }
-            total_bytes += blob.size(); total_vox += CHUNK_VOX;
+            auto b = metrics::evaluate(vox, rec);
+            sp += b.psnr_db; sg += b.gmsd; sm += b.ms_ssim; sh += b.haarpsi;
+            ss += b.sharpness; se += b.epi; sgeo += b.geomean();
+            total_bytes += blob.size(); total_vox += CHUNK_VOX; ++nc;
         }
-        f64 mse = sum_se / total_vox;
-        f64 psnr = mse <= 0 ? 999.0 : 10.0 * std::log10(255.0 * 255.0 / mse);
         f64 ratio = double(total_vox) / total_bytes;
-        f64 bpv = 8.0 * total_bytes / total_vox;
-        std::printf("%6.1f  %10.2f  %9.1fx  %12.4f\n", q, psnr, ratio, bpv);
+        std::printf("%5.1f %6.1fx %7.2f %7.3f %7.3f %7.3f %7.3f %7.3f %7.3f\n",
+                    q, ratio, sp/nc, sg/nc, sm/nc, sh/nc, ss/nc, se/nc, sgeo/nc);
     }
     return 0;
 }
