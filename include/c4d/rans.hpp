@@ -95,7 +95,9 @@ class Encoder {
 public:
     void put(const FreqTable& t, u32 sym) {
         u32 f = t.freq[sym], c = t.cum[sym];
-        u32 x_max = ((RANS_L >> PROB_BITS) << 16) * f;   // renorm threshold
+        // Renorm threshold; u64 because freq up to PROB_SCALE makes this exceed
+        // 2^32 (a single-symbol alphabet hits exactly that).
+        u64 x_max = (u64((RANS_L >> PROB_BITS) << 16)) * f;
         while (state_ >= x_max) { out_.push_back(u16(state_ & 0xffff)); state_ >>= 16; }
         state_ = ((state_ / f) << PROB_BITS) + (state_ % f) + c;
     }
