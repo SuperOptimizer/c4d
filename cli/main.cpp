@@ -215,8 +215,13 @@ int main(int argc, char** argv) {
     if (cmd == "decode") return decode(argc, argv);
     if (cmd == "info")   return info(argc, argv);
     if (cmd == "compact") {
-        std::fprintf(stderr, "c4d compact: not yet implemented\n");
-        return 1;
+        if (argc < 4) { std::fprintf(stderr, "usage: c4d compact <in.c4d> <out.c4d>\n"); return 2; }
+        auto in = read_file(argv[2]);
+        auto out = archive::compact(in);
+        write_file(argv[3], out);
+        std::fprintf(stderr, "compacted %s (%zu B) -> %s (%zu B)\n",
+                     argv[2], in.size(), argv[3], out.size());
+        return 0;
     }
     return usage();
 }

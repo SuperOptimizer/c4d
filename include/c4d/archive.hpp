@@ -85,6 +85,29 @@ public:
 
     void set_metadata(std::string json) { metadata_ = std::move(json); }
 
+    // Seed the writer with an existing archive's raw bytes + parsed members so
+    // new payloads append after them (their offsets stay valid; the old footer
+    // becomes dead bytes). Used by append()/compose() (§5.5/§5.7).
+    void seed_existing(std::span<const u8> existing, std::vector<Member> members) {
+        blob_.assign(existing.begin(), existing.end());
+        members_ = std::move(members);
+    }
+    // Add a member whose payloads already live in `existing` at recorded offsets
+    // (offsets are file-absolute and remain valid since we kept the prefix).
+    void add_existing_member(Member m) { members_.push_back(std::move(m)); }
+    // Append member `m` whose payloads are in `src` (a different file): copy each
+    // live payload to the current EOF and rewrite its index offset (§5.7 compose).
+    void add_remapped_member(const Member& m, std::span<const u8> src) {
+        Member out = m;
+        for (auto& e : out.index) {
+            if (e.flags & IndexEntry::ABSENT) continue;
+            u64 old_off = e.offset;
+            e.offset = blob_.size();
+            blob_.insert(blob_.end(), src.begin() + old_off, src.begin() + old_off + e.length);
+        }
+        members_.push_back(std::move(out));
+    }
+
     std::vector<u8> finish() {
         std::vector<u8> out = std::move(blob_);
 
@@ -177,6 +200,10 @@ public:
         return xxhash64(data_.subspan(e.offset, e.length)) == e.checksum;
     }
 
+    // Parsed members (offsets are file-absolute) — for append/compose reuse.
+    const std::vector<Member>& members() const { return members_; }
+    std::span<const u8> raw() const { return data_; }
+
 private:
     void parse() {
         const u8* t = data_.data() + data_.size() - TRAILER_SIZE;
@@ -213,5 +240,54 @@ private:
     std::vector<Member> members_;
     std::string_view meta_;
 };
+
+// --- Append (§5.5): pure append --------------------------------------------
+// Add new members to an existing archive without rewriting its bytes. Existing
+// payloads keep their offsets; new payloads + a fresh index/dir/meta/trailer go
+// at EOF. The old footer becomes dead bytes; readers always read the newest
+// trailer from EOF. `new_chunks[i]`/`new_qs[i]` describe each new member.
+struct NewMember {
+    std::string name; MemberType type; Coord3 shape;
+    std::vector<std::vector<u8>> chunks; std::vector<f32> qs;
+};
+[[nodiscard]] inline std::vector<u8> append(std::span<const u8> existing,
+                                            const std::vector<NewMember>& adds,
+                                            std::string metadata = {}) {
+    Reader r(existing);
+    Writer w;
+    w.seed_existing(existing, r.members());          // keep prefix + member offsets
+    for (const auto& a : adds)
+        w.add_member(a.name, a.type, a.shape, a.chunks, a.qs);
+    w.set_metadata(metadata.empty() ? std::string(r.metadata()) : std::move(metadata));
+    return w.finish();
+}
+
+// --- Compose (§5.7): disjoint stitch ---------------------------------------
+// Merge two archives by appending B's members after A's payloads (B's payloads
+// are copied to EOF and their index offsets rewritten). A member name present in
+// BOTH is an error (disjoint only). Metadata of A wins unless overridden.
+[[nodiscard]] inline std::vector<u8> compose(std::span<const u8> a, std::span<const u8> b,
+                                             std::string metadata = {}) {
+    Reader ra(a), rb(b);
+    Writer w;
+    w.seed_existing(a, ra.members());
+    for (const auto& mb : rb.members()) {
+        if (ra.find(mb.name) != SIZE_MAX) std::abort();   // §5.7: same member => error
+        w.add_remapped_member(mb, rb.raw());
+    }
+    w.set_metadata(metadata.empty() ? std::string(ra.metadata()) : std::move(metadata));
+    return w.finish();
+}
+
+// --- Compact (§5.6): copy live members to a fresh file ---------------------
+// Rebuilds an archive from scratch, dropping dead bytes left by prior appends
+// (each member's live payloads are re-emitted contiguously). Pure offline.
+[[nodiscard]] inline std::vector<u8> compact(std::span<const u8> in) {
+    Reader r(in);
+    Writer w;
+    for (const auto& m : r.members()) w.add_remapped_member(m, r.raw());
+    w.set_metadata(std::string(r.metadata()));
+    return w.finish();
+}
 
 } // namespace c4d::archive
