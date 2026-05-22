@@ -412,17 +412,22 @@ Recommended coding recipe (from point-cloud / G-PCC / sparse-voxel-DAG research)
    subtrees. Every all-valid / all-invalid region collapses to a single shared
    node, and repeated boundary motifs dedup — 1–3 orders of magnitude node
    reduction. This is the "large uniform → ~nothing" mechanism.
-2. **Neighbor-occupancy context for the residual boundary shell:** code each
-   surviving node's 8-bit child-occupancy byte with an rANS context formed from
-   the occupancy of already-coded neighbors (a reduced set — 6 face neighbors, or
-   +12 edge bucketed — to keep the table small). Surfaces are locally planar, so
-   neighbors are highly predictive. This codes the thin shell the DAG can't dedup.
-3. **Planar-mode shortcut:** when a node's occupied children are coplanar, signal
-   one plane position per axis instead of the full byte (CT surfaces are locally
-   planar).
-4. **rANS the DAG topology + skewed child-pointer references** (a few nodes are
-   referenced often — entropy-code the skew rather than store raw pointers; this
-   is what makes step 1 net-win on *bytes*, not just node count).
+2. **rANS the DAG topology + skewed child-pointer references** (a few nodes are
+   referenced often — entropy-code the child-id *gaps* rather than store raw
+   pointers; this is what makes step 1 net-win on *bytes*, not just node count).
+   **SHIPPED.**
+
+> *Steps 2-3 (neighbor-occupancy context + planar-mode) — investigated, NOT
+> shipped (measured 2026-05).* They target the per-node occupancy-byte cost, but
+> the measurement says there's no headroom: (a) the shipped child-id-gap coding
+> is already within **0.7%** of its entropy on a clean sphere mask — no slack to
+> recover; (b) the two regimes that matter leave nothing to gain — a *clean*
+> planar surface already collapses to ~nothing via the DAG (a tilted plane = 13
+> nodes / 211 B), while a *noisy* fractal boundary (the 76%-valid 3.24µm chunk =
+> 29551 nodes / 417 KB) is dominated by node *count*, which per-node context
+> can't fix. The real lever for expensive masks is **lossy dilation** (`valid_frac`,
+> already shipped): vf=0.85 cut that 417 KB to 193 KB, vf=0.70 to 178 B. So:
+> ship the DAG + gap-rANS, expose dilation, skip the occupancy-byte refinements.
 
 (Skip symmetry-aware merging — high encode cost, pointless for a lossy mask. No
 neural occupancy models — CPU/constraint.)
