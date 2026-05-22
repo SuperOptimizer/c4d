@@ -73,10 +73,16 @@ struct Payload {
     std::vector<u8> tokens;     // rANS symbol stream
     std::vector<u8> bypass;     // raw mantissa + sign + run bits
     std::vector<u8> outliers;   // optional sparse correction stream (§4.6)
+    // Uniform fast-path (§7 T2): a perfectly-constant chunk codes as just its
+    // value (no DWT/quant/entropy/tables). uniform=true => decode fills `uval`.
+    bool uniform = false;
+    u8   uval = 0;
     // Serialized form is produced by serialize(); the archive stores that blob.
     std::vector<u8> serialize() const;
     static Payload deserialize(std::span<const u8> bytes);
-    size_t size_bytes() const { return tokens.size() + bypass.size() + 16 + sizeof(StepTable); }
+    size_t size_bytes() const {
+        return uniform ? 2 : (tokens.size() + bypass.size() + 16 + sizeof(StepTable));
+    }
 };
 
 // --- token-stream generation (encode) --------------------------------------
@@ -120,6 +126,18 @@ struct EncodeOpts {
 
 // Encode one 128^3 u8 chunk. `vox` is row-major Z,Y,X.
 inline Payload encode_chunk(std::span<const u8> vox, const EncodeOpts& opt) {
+    // 0. Uniform fast-path (§7 T2): a perfectly-constant chunk needs no transform
+    //    or entropy coding — just its value. (All-zero chunks are usually marked
+    //    ABSENT upstream, but a constant-NONZERO block — solid material, or air
+    //    filled to a constant — would otherwise pay full per-chunk table overhead
+    //    ~1.7 KB for zero information.) Lossless and exact regardless of q.
+    {
+        u8 v0 = vox.empty() ? 0 : vox[0];
+        bool uni = true;
+        for (u8 v : vox) if (v != v0) { uni = false; break; }
+        if (uni) { Payload p; p.uniform = true; p.uval = v0; p.q = opt.q; return p; }
+    }
+
     // 1. to float, subtract DC (mean)
     std::vector<f32> coef(CHUNK_VOX);
     f64 mean = 0; for (u8 v : vox) mean += v; mean /= CHUNK_VOX;
@@ -199,6 +217,8 @@ inline Payload encode_chunk(std::span<const u8> vox, f32 q) {
 
 // Decode one chunk payload back to a 128^3 u8 cube.
 inline void decode_chunk(const Payload& p, std::span<u8> out) {
+    if (p.uniform) { std::fill(out.begin(), out.end(), p.uval); return; }  // §7 T2
+
     // rebuild NUM_CTX freq tables + token count
     size_t pos = 0;
     std::array<rans::FreqTable, NUM_CTX> tbls;
@@ -255,6 +275,9 @@ inline void decode_chunk(const Payload& p, std::span<u8> out) {
 // --- payload serialization (flat blob for the archive) ---------------------
 inline std::vector<u8> Payload::serialize() const {
     std::vector<u8> b;
+    // tag byte: 1 = uniform fast-path (value follows), 0 = normal payload.
+    if (uniform) { b.push_back(1); b.push_back(uval); return b; }
+    b.push_back(0);
     auto push32 = [&](u32 v) { for (int i = 0; i < 4; ++i) b.push_back(u8((v >> (8 * i)) & 0xff)); };
     auto pushf  = [&](f32 f) { u32 v; std::memcpy(&v, &f, 4); push32(v); };
     pushf(dc); pushf(q); pushf(tolerance);
@@ -272,6 +295,8 @@ inline std::vector<u8> Payload::serialize() const {
 
 inline Payload Payload::deserialize(std::span<const u8> bytes) {
     Payload p; size_t pos = 0;
+    u8 tag = bytes[pos++];
+    if (tag == 1) { p.uniform = true; p.uval = bytes[pos]; return p; }  // §7 T2
     auto rd32 = [&] { u32 v = 0; for (int i = 0; i < 4; ++i) v |= u32(bytes[pos++]) << (8 * i); return v; };
     auto rdf  = [&] { u32 v = rd32(); f32 f; std::memcpy(&f, &v, 4); return f; };
     p.dc = rdf(); p.q = rdf(); p.tolerance = rdf();
