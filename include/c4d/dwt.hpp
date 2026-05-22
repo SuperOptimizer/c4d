@@ -384,6 +384,20 @@ inline void forward(f32* vol, f32 bias = 0.f, u32 levels = DWT_LEVELS) noexcept 
     unpack_padded(pad, vol);
 }
 
+// As forward(), but leaves the transformed coefficients in the (returned)
+// slice-padded scratch instead of unpacking back to dense. The caller consumes
+// them slice-by-slice (e.g. quantize_padded) — saves the 256KB unpack copy when
+// nothing needs the dense layout. Buffer valid until the next DWT call on this
+// thread. SLICE pitch is the only thing the caller needs to know (exported).
+[[nodiscard]] inline f32* forward_to_padded(const f32* vol, f32 bias, u32 levels = DWT_LEVELS) noexcept {
+    f32* pad = padded_scratch();
+    if (bias != 0.f) pack_padded_bias(vol, pad, bias);
+    else             pack_padded(vol, pad);
+    u32 s = CHUNK;
+    for (u32 l = 0; l < levels; ++l) { fwd_step(pad, s); s /= 2; }
+    return pad;
+}
+
 // Full multi-level inverse transform (coarsest level first).
 inline void inverse(f32* vol, u32 levels = DWT_LEVELS) noexcept {
     f32* pad = padded_scratch();
@@ -393,6 +407,16 @@ inline void inverse(f32* vol, u32 levels = DWT_LEVELS) noexcept {
     for (u32 l = 0; l < levels; ++l) { sizes[l] = s; s /= 2; }
     for (i32 l = static_cast<i32>(levels) - 1; l >= 0; --l) inv_step(pad, sizes[static_cast<u32>(l)]);
     unpack_padded(pad, vol);
+}
+
+// Inverse transform IN the slice-padded buffer (already packed, e.g. by
+// dequantize_padded) — no pack/unpack copies. Caller reads the result back
+// slice-by-slice (the decode clamp does). Returns the same `pad`.
+inline void inverse_in_padded(f32* pad, u32 levels = DWT_LEVELS) noexcept {
+    std::array<u32, 16> sizes{};
+    u32 s = CHUNK;
+    for (u32 l = 0; l < levels; ++l) { sizes[l] = s; s /= 2; }
+    for (i32 l = static_cast<i32>(levels) - 1; l >= 0; --l) inv_step(pad, sizes[static_cast<u32>(l)]);
 }
 
 } // namespace c4d::dwt

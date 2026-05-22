@@ -156,6 +156,46 @@ inline u32 quantize(std::span<const f32> coeffs, const StepTable& t,
     return nnz;
 }
 
+// Quantize directly from the DWT's slice-padded buffer (dwt::forward_to_padded)
+// into dense `out`, avoiding the 256KB unpack-to-dense pass. Each slice is
+// CHUNK*CHUNK contiguous floats at `pad + z*slice_pitch`, mapping to the dense
+// run out[z*CHUNK*CHUNK ..]; the inner SIMD loop is identical to quantize(),
+// just run per-slice. Byte-identical result to forward()+quantize().
+inline u32 quantize_padded(const f32* pad, u32 slice_pitch, const StepTable& t,
+                           std::span<i32> out) noexcept {
+    const f32* step = step_field(t);
+    constexpr u32 SVOX = CHUNK * CHUNK;       // floats per dense slice
+    u32 nnz = 0;
+    for (u32 z = 0; z < CHUNK; ++z) {
+        const f32* c = pad + z * slice_pitch;
+        const f32* s = step + z * SVOX;
+        i32* o = out.data() + z * SVOX;
+#ifdef C4D_QUANT_SIMD
+        namespace stdx = std::experimental;
+        using vf = stdx::native_simd<f32>;
+        using vi = stdx::rebind_simd_t<i32, vf>;
+        constexpr u32 W = vf::size();
+        u32 i = 0;
+        for (; i + W <= SVOX; i += W) {
+            vf cc(&c[i], stdx::element_aligned);
+            vf ss(&s[i], stdx::element_aligned);
+            vf a = stdx::abs(cc);
+            vf mag = stdx::floor(a / ss - 0.5f) + 1.0f;
+            vf sgn = vf(1.0f); where(cc < 0.f, sgn) = -1.0f;
+            vf qf = mag * sgn;
+            where((a < 0.5f * ss) || (ss <= 0.f), qf) = 0.0f;
+            vi q = stdx::static_simd_cast<vi>(qf);
+            q.copy_to(&o[i], stdx::element_aligned);
+            nnz += stdx::popcount(q != 0);
+        }
+        for (; i < SVOX; ++i) { i32 q = dead_zone_quantize(c[i], s[i]); o[i] = q; nnz += (q != 0); }
+#else
+        for (u32 i = 0; i < SVOX; ++i) { i32 q = dead_zone_quantize(c[i], s[i]); o[i] = q; nnz += (q != 0); }
+#endif
+    }
+    return nnz;
+}
+
 // Dequantize integer levels back to coefficients (out = q * step, mid-tread).
 inline void dequantize(std::span<const i32> q, const StepTable& t,
                        std::span<f32> out) noexcept {
@@ -176,6 +216,37 @@ inline void dequantize(std::span<const i32> q, const StepTable& t,
 #else
     for (u32 i = 0; i < CHUNK_VOX; ++i) out[i] = dead_zone_dequantize(q[i], step[i]);
 #endif
+}
+
+// Dequantize dense `q` directly INTO the DWT's slice-padded buffer, avoiding the
+// 256KB pack-to-padded that dwt::inverse would otherwise do. Each dense slice
+// q[z*CHUNK*CHUNK ..] writes the padded run pad[z*slice_pitch ..]; inner SIMD is
+// identical to dequantize(), per-slice. Byte-identical to dequantize()+pack.
+inline void dequantize_padded(std::span<const i32> q, u32 slice_pitch,
+                              const StepTable& t, f32* pad) noexcept {
+    const f32* step = step_field(t);
+    constexpr u32 SVOX = CHUNK * CHUNK;
+    for (u32 z = 0; z < CHUNK; ++z) {
+        const i32* qi = q.data() + z * SVOX;
+        const f32* s = step + z * SVOX;
+        f32* o = pad + z * slice_pitch;
+#ifdef C4D_QUANT_SIMD
+        namespace stdx = std::experimental;
+        using vf = stdx::native_simd<f32>;
+        using vi = stdx::rebind_simd_t<i32, vf>;
+        constexpr u32 W = vf::size();
+        u32 i = 0;
+        for (; i + W <= SVOX; i += W) {
+            vi qq(&qi[i], stdx::element_aligned);
+            vf qf = stdx::static_simd_cast<vf>(qq);
+            vf ss(&s[i], stdx::element_aligned);
+            (qf * ss).copy_to(&o[i], stdx::element_aligned);
+        }
+        for (; i < SVOX; ++i) o[i] = dead_zone_dequantize(qi[i], s[i]);
+#else
+        for (u32 i = 0; i < SVOX; ++i) o[i] = dead_zone_dequantize(qi[i], s[i]);
+#endif
+    }
 }
 
 } // namespace c4d

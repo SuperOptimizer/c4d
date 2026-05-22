@@ -210,12 +210,21 @@ inline ChunkAnalysis analyze_chunk(std::span<const u8> vox, const EncodeOpts& op
     f64 sum = 0;
     for (u32 i = 0; i < CHUNK_VOX; ++i) { f32 f = static_cast<f32>(vox[i]); coef[i] = f; sum += f; }
     f32 mean = static_cast<f32>(sum / CHUNK_VOX);
-    dwt::forward(coef.data(), mean);
     a.steps = StepTable::from_q(opt.q);
-    f64 sigma = (opt.noise_aware || opt.perceptual_rdo) ? estimate_noise_sigma(coef) : 0.0;
-    if (opt.noise_aware)   a.steps = NoiseShrink::analyze(coef).apply(a.steps, opt.shrink_strength);
-    if (opt.perceptual_rdo) a.steps = PerceptualRDO::apply(a.steps, vox, sigma, opt.rdo_strength);
-    u32 nnz = quantize(coef, a.steps, ql);
+    u32 nnz;
+    if (opt.noise_aware || opt.perceptual_rdo) {
+        // These read the dense transformed coef, so unpack to dense as before.
+        dwt::forward(coef.data(), mean);
+        f64 sigma = estimate_noise_sigma(coef);
+        if (opt.noise_aware)    a.steps = NoiseShrink::analyze(coef).apply(a.steps, opt.shrink_strength);
+        if (opt.perceptual_rdo) a.steps = PerceptualRDO::apply(a.steps, vox, sigma, opt.rdo_strength);
+        nnz = quantize(coef, a.steps, ql);
+    } else {
+        // Fast path: quantize straight from the DWT's slice-padded buffer — skips
+        // the 256KB unpack-to-dense (the repack memmove was ~5% on encode).
+        const f32* pad = dwt::forward_to_padded(coef.data(), mean);
+        nnz = quantize_padded(pad, dwt::SLICE, a.steps, ql);
+    }
 
     TokenStream ts;
     const SubbandMap& sm = subband_map();
@@ -413,38 +422,47 @@ inline void decode_chunk_shared(const Payload& p, const SharedTables* shared,
         }
     }
 
-    // dequantize with the steps carried in the chunk (§4.1), inverse DWT, add
-    // DC, clamp to u8. The SIMD dequantize (256K mults) beats folding a scalar
-    // level*step into the token loop — measured: fused was ~4% slower on decode.
-    std::vector<f32>& coef = scratch().coef;
-    dequantize(ql, p.steps, coef);
-    dwt::inverse(coef.data());
-    // Add DC, round, clamp to [0,255], narrow to u8. This was the single hottest
-    // line in the codec (~11% of decode instructions) when scalar — the nested
-    // ternary + per-element f32->u8 narrowing didn't auto-vectorize. SIMD: add,
-    // min/max clamp, round-half-up, cast f32->i32->u8.
+    // Dequantize straight into the DWT's slice-padded buffer, inverse-transform
+    // in place, then add DC + round + clamp to u8 reading the padded buffer
+    // slice-by-slice. This skips BOTH the dequant->dense write's later pack AND
+    // the post-inverse unpack (each 256KB) — the repack memmove was ~5% of decode.
+    f32* pad = dwt::padded_scratch();
+    dequantize_padded(ql, dwt::SLICE, p.steps, pad);
+    dwt::inverse_in_padded(pad);
+    // The DC+round+clamp+narrow loop was the single hottest line in the codec
+    // (~11% of decode instructions) when scalar (nested ternary + per-element
+    // f32->u8 narrowing didn't auto-vectorize). SIMD per dense slice.
     const f32 dc = p.dc;
+    constexpr u32 SVOX = CHUNK * CHUNK;
 #ifdef C4D_CHUNK_SIMD
     namespace stdx = std::experimental;
     using vf = stdx::native_simd<f32>;
     using vi = stdx::rebind_simd_t<i32, vf>;
     using vu8 = stdx::rebind_simd_t<u8, vf>;
     constexpr u32 W = vf::size();
-    u32 i = 0;
-    for (; i + W <= CHUNK_VOX; i += W) {
-        vf v = vf(&coef[i], stdx::element_aligned) + dc;
-        v = stdx::min(stdx::max(v + 0.5f, vf(0.f)), vf(255.f));   // round-half-up + clamp
-        vu8 b = stdx::static_simd_cast<vu8>(stdx::static_simd_cast<vi>(v));
-        b.copy_to(&out[i], stdx::element_aligned);
-    }
-    for (; i < CHUNK_VOX; ++i) {
-        f32 v = coef[i] + dc;
-        out[i] = static_cast<u8>(v < 0.f ? 0.f : (v > 255.f ? 255.f : v + 0.5f));
+    for (u32 z = 0; z < CHUNK; ++z) {
+        const f32* c = pad + z * dwt::SLICE;
+        u8* o = out.data() + z * SVOX;
+        u32 i = 0;
+        for (; i + W <= SVOX; i += W) {
+            vf v = vf(&c[i], stdx::element_aligned) + dc;
+            v = stdx::min(stdx::max(v + 0.5f, vf(0.f)), vf(255.f));   // round-half-up + clamp
+            vu8 b = stdx::static_simd_cast<vu8>(stdx::static_simd_cast<vi>(v));
+            b.copy_to(&o[i], stdx::element_aligned);
+        }
+        for (; i < SVOX; ++i) {
+            f32 v = c[i] + dc;
+            o[i] = static_cast<u8>(v < 0.f ? 0.f : (v > 255.f ? 255.f : v + 0.5f));
+        }
     }
 #else
-    for (u32 i = 0; i < CHUNK_VOX; ++i) {
-        f32 v = coef[i] + dc;
-        out[i] = static_cast<u8>(v < 0.f ? 0.f : (v > 255.f ? 255.f : v + 0.5f));
+    for (u32 z = 0; z < CHUNK; ++z) {
+        const f32* c = pad + z * dwt::SLICE;
+        u8* o = out.data() + z * SVOX;
+        for (u32 i = 0; i < SVOX; ++i) {
+            f32 v = c[i] + dc;
+            o[i] = static_cast<u8>(v < 0.f ? 0.f : (v > 255.f ? 255.f : v + 0.5f));
+        }
     }
 #endif
 
