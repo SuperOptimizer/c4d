@@ -82,30 +82,48 @@ struct SubbandMap {
 // Reusable per-thread scratch for the per-voxel step field — avoids a 256 KB
 // heap alloc + zero-fill on every quantize/dequantize call (measured in the asm
 // as an operator new/delete + memset per call). Thread-local keeps the codec
-// reentrant/thread-safe (each calling thread gets its own buffer).
-inline f32* step_scratch() noexcept {
-    thread_local std::vector<f32> buf(CHUNK_VOX);
-    return buf.data();
+// reentrant/thread-safe (each calling thread gets its own buffer). The field is
+// memoized against the StepTable that built it: a whole region encodes/decodes
+// at one q, so the 256K fill happens once and is reused across all 64 chunks in
+// both directions (the 40-float compare is far cheaper than the fill).
+struct StepFieldCache {
+    std::vector<f32> field{std::vector<f32>(CHUNK_VOX)};
+    StepTable cached{};        // the table that produced `field`
+    bool valid = false;
+};
+inline StepFieldCache& step_cache() noexcept {
+    thread_local StepFieldCache c;
+    return c;
 }
 
-// Per-voxel quantizer step for the current StepTable, materialized into a flat
-// array so the dead-zone loop is a contiguous SIMD pass (no per-voxel table
-// indirection). The subband id per voxel is fixed geometry; only the 40 step
-// values change per chunk, so this fill is cheap.
-inline void build_step_field(const StepTable& t, std::span<f32> field) noexcept {
+[[nodiscard]] inline bool step_tables_equal(const StepTable& a, const StepTable& b) noexcept {
+    for (u32 l = 0; l < DWT_LEVELS; ++l)
+        for (u32 o = 0; o < 8; ++o) if (a.step[l][o] != b.step[l][o]) return false;
+    return true;
+}
+
+// Per-voxel quantizer step for `t`, materialized into a flat array so the
+// dead-zone loop is a contiguous SIMD pass (no per-voxel table indirection).
+// Returns the cached field if `t` is unchanged from the last call; otherwise
+// rebuilds it. The subband id per voxel is fixed geometry; only the 40 step
+// values change per chunk.
+[[nodiscard]] inline const f32* step_field(const StepTable& t) noexcept {
+    StepFieldCache& c = step_cache();
+    if (c.valid && step_tables_equal(c.cached, t)) return c.field.data();
     const SubbandMap& m = subband_map();
-    // flatten the (level,orient) table to a 256-entry lookup keyed by the id byte
-    std::array<f32, 256> lut{};
+    std::array<f32, 256> lut{};   // flatten (level,orient) -> id-byte lookup
     for (u32 l = 0; l < DWT_LEVELS; ++l)
         for (u32 o = 0; o < 8; ++o) lut[(l << 3) | o] = t.step[l][o];
+    f32* field = c.field.data();
     for (u32 i = 0; i < CHUNK_VOX; ++i) field[i] = lut[m.id[i]];
+    c.cached = t; c.valid = true;
+    return field;
 }
 
 // Quantize a whole transformed cube into integer levels using the step table.
 inline void quantize(std::span<const f32> coeffs, const StepTable& t,
                      std::span<i32> out) noexcept {
-    std::span<f32> step(step_scratch(), CHUNK_VOX);
-    build_step_field(t, step);
+    std::span<const f32> step(step_field(t), CHUNK_VOX);
 #ifdef C4D_QUANT_SIMD
     // Work entirely in the float domain (masks are native to vf), produce a
     // signed float level, then one cast to int. Matches dead_zone_quantize.
@@ -135,8 +153,7 @@ inline void quantize(std::span<const f32> coeffs, const StepTable& t,
 // Dequantize integer levels back to coefficients (out = q * step, mid-tread).
 inline void dequantize(std::span<const i32> q, const StepTable& t,
                        std::span<f32> out) noexcept {
-    std::span<f32> step(step_scratch(), CHUNK_VOX);
-    build_step_field(t, step);
+    std::span<const f32> step(step_field(t), CHUNK_VOX);
 #ifdef C4D_QUANT_SIMD
     namespace stdx = std::experimental;
     using vf = stdx::native_simd<f32>;
