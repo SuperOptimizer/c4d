@@ -197,8 +197,13 @@ inline ChunkAnalysis analyze_chunk(std::span<const u8> vox, const EncodeOpts& op
 
     std::vector<f32>& coef = scratch().coef;     // per-thread reusable scratch
     std::vector<i32>& ql   = scratch().ql;
-    f64 mean = 0; for (u8 v : vox) mean += v; mean /= CHUNK_VOX;
-    for (u32 i = 0; i < CHUNK_VOX; ++i) coef[i] = static_cast<f32>(vox[i]) - static_cast<f32>(mean);
+    // One pass over the u8 cube: widen to f32 into coef AND accumulate the sum.
+    // (Was two passes — a sum pass then a widen-subtract pass.) The DC subtract
+    // is a second cheap f32-only pass once the mean is known.
+    f64 sum = 0;
+    for (u32 i = 0; i < CHUNK_VOX; ++i) { f32 f = static_cast<f32>(vox[i]); coef[i] = f; sum += f; }
+    f32 mean = static_cast<f32>(sum / CHUNK_VOX);
+    for (u32 i = 0; i < CHUNK_VOX; ++i) coef[i] -= mean;
     dwt::forward(coef.data());
     a.steps = StepTable::from_q(opt.q);
     f64 sigma = (opt.noise_aware || opt.perceptual_rdo) ? estimate_noise_sigma(coef) : 0.0;
@@ -223,7 +228,7 @@ inline ChunkAnalysis analyze_chunk(std::span<const u8> vox, const EncodeOpts& op
         ts.emit_nonzero(v, context_id(sm.id[idx], prev_class)); prev_class = 1;
     }
     if (zeros) ts.emit_run(zeros, context_id(run_start_sb, prev_class));
-    a.dc = static_cast<f32>(mean);
+    a.dc = mean;
     a.toks = std::move(ts.toks);
     a.ctx = std::move(ts.ctx);
     a.counts = std::move(ts.counts);
@@ -358,7 +363,8 @@ inline void decode_chunk_shared(const Payload& p, const SharedTables* shared,
     }
 
     // dequantize with the steps carried in the chunk (§4.1), inverse DWT, add
-    // DC, clamp to u8.
+    // DC, clamp to u8. The SIMD dequantize (256K mults) beats folding a scalar
+    // level*step into the token loop — measured: fused was ~4% slower on decode.
     std::vector<f32>& coef = scratch().coef;
     dequantize(ql, p.steps, coef);
     dwt::inverse(coef.data());
