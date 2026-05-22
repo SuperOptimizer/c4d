@@ -77,6 +77,9 @@ struct Payload {
     // value (no DWT/quant/entropy/tables). uniform=true => decode fills `uval`.
     bool uniform = false;
     u8   uval = 0;
+    // Shared-tables mode: when true, the freq tables are NOT in `tokens` (they're
+    // carried once at group/member level); decode must supply them externally.
+    bool shared_tables = false;
     // Serialized form is produced by serialize(); the archive stores that blob.
     std::vector<u8> serialize() const;
     static Payload deserialize(std::span<const u8> bytes);
@@ -110,7 +113,10 @@ struct TokenStream {
     }
 };
 
+struct SharedTables;
 inline void decode_chunk(const Payload& p, std::span<u8> out);  // fwd decl
+inline void decode_chunk_shared(const Payload& p, const SharedTables* shared,
+                                std::span<u8> out);              // fwd decl
 
 // Encoder options. The decoder reads steps from the stream regardless, so these
 // only affect the encoder's step-table choice (§4.10) — never the bitstream
@@ -124,51 +130,61 @@ struct EncodeOpts {
     f64 rdo_strength = 0.5;       // 0..1, how much to tighten coherent HF
 };
 
-// Encode one 128^3 u8 chunk. `vox` is row-major Z,Y,X.
-inline Payload encode_chunk(std::span<const u8> vox, const EncodeOpts& opt) {
-    // 0. Uniform fast-path (§7 T2): a perfectly-constant chunk needs no transform
-    //    or entropy coding — just its value. (All-zero chunks are usually marked
-    //    ABSENT upstream, but a constant-NONZERO block — solid material, or air
-    //    filled to a constant — would otherwise pay full per-chunk table overhead
-    //    ~1.7 KB for zero information.) Lossless and exact regardless of q.
-    {
-        u8 v0 = vox.empty() ? 0 : vox[0];
-        bool uni = true;
-        for (u8 v : vox) if (v != v0) { uni = false; break; }
-        if (uni) { Payload p; p.uniform = true; p.uval = v0; p.q = opt.q; return p; }
+// Per-context shared entropy tables (§ shared-tables / no-independence). When a
+// group of chunks shares one table set, the per-chunk table overhead (NUM_CTX
+// serialized freq tables, ~1.5 KB) is paid ONCE for the group instead of per
+// chunk. Measured 4-8% smaller total at 64³. The decoder must be given the same
+// tables (carried once at group/member level).
+struct SharedTables {
+    std::array<rans::FreqTable, NUM_CTX> tbl;
+    std::array<std::vector<u32>, NUM_CTX> counts;   // accumulator during analyze
+    SharedTables() { for (auto& c : counts) c.assign(ALPHABET, 0); }
+    void accumulate(const std::array<std::vector<u32>, NUM_CTX>& src) {
+        for (u32 c = 0; c < NUM_CTX; ++c)
+            for (u32 s = 0; s < ALPHABET; ++s) counts[c][s] += src[c][s];
     }
+    void build() { for (u32 c = 0; c < NUM_CTX; ++c) tbl[c] = rans::FreqTable::build(counts[c]); }
+    void serialize(std::vector<u8>& out) const { for (u32 c = 0; c < NUM_CTX; ++c) tbl[c].serialize(out); }
+    static SharedTables deserialize(std::span<const u8> in, size_t& pos) {
+        SharedTables s;
+        for (u32 c = 0; c < NUM_CTX; ++c) s.tbl[c] = rans::FreqTable::deserialize(in, pos);
+        return s;
+    }
+};
 
-    // 1. to float, subtract DC (mean)
+// Phase 1 of encoding: everything up to (not including) the rANS pass — DC, DWT,
+// quantization, token generation. Reused by both per-chunk and group encode.
+struct ChunkAnalysis {
+    bool uniform = false; u8 uval = 0;
+    f32 dc = 0, q = 0, tolerance = 0;
+    StepTable steps{};
+    std::vector<u32> toks;                       // forward-order tokens
+    std::vector<u8>  ctx;                        // per-token context id
+    std::array<std::vector<u32>, NUM_CTX> counts;// per-context histograms (for tables)
+    std::vector<u8>  bypass_bytes;               // finished bypass stream
+    std::vector<u8>  orig;                        // kept for the outlier pass
+};
+
+inline ChunkAnalysis analyze_chunk(std::span<const u8> vox, const EncodeOpts& opt) {
+    ChunkAnalysis a; a.q = opt.q; a.tolerance = opt.tolerance;
+    { u8 v0 = vox.empty() ? 0 : vox[0]; bool uni = true;
+      for (u8 v : vox) if (v != v0) { uni = false; break; }
+      if (uni) { a.uniform = true; a.uval = v0; return a; } }
+
     std::vector<f32> coef(CHUNK_VOX);
     f64 mean = 0; for (u8 v : vox) mean += v; mean /= CHUNK_VOX;
     for (u32 i = 0; i < CHUNK_VOX; ++i) coef[i] = static_cast<f32>(vox[i]) - static_cast<f32>(mean);
-
-    // 2. DWT
     dwt::forward(coef.data());
-
-    // 3. choose per-subband steps (encoder policy; decoder reads them back).
-    StepTable steps = StepTable::from_q(opt.q);
-    f64 sigma = (opt.noise_aware || opt.perceptual_rdo)
-              ? estimate_noise_sigma(coef) : 0.0;
-    if (opt.noise_aware)
-        steps = NoiseShrink::analyze(coef).apply(steps, opt.shrink_strength);
-    if (opt.perceptual_rdo)
-        steps = PerceptualRDO::apply(steps, vox, sigma, opt.rdo_strength);
-
+    a.steps = StepTable::from_q(opt.q);
+    f64 sigma = (opt.noise_aware || opt.perceptual_rdo) ? estimate_noise_sigma(coef) : 0.0;
+    if (opt.noise_aware)   a.steps = NoiseShrink::analyze(coef).apply(a.steps, opt.shrink_strength);
+    if (opt.perceptual_rdo) a.steps = PerceptualRDO::apply(a.steps, vox, sigma, opt.rdo_strength);
     std::vector<i32> ql(CHUNK_VOX);
-    quantize(coef, steps, ql);
+    quantize(coef, a.steps, ql);
 
-    // 4. model-the-zeros token generation (§4.7). Coefficients are visited in
-    // the canonical scan order (subband-contiguous, raster within band) so the
-    // dead-zone zeros form long runs the zero-run/EOB tokens collapse cheaply.
-    // (Frequency-diagonal within-band order measured worse here — see scan.hpp.)
     TokenStream ts;
     const std::vector<u32>& order = scan_order().order;
     const SubbandMap& sm = subband_map();
-
-    // Each token's context = (level bucket of the position where it applies) ×
-    // (previous token class: run=0, magnitude=1). A run token uses the subband at
-    // its START position; a magnitude token uses its own position's subband.
     u32 zeros = 0, prev_class = 1, run_start_sb = 0;
     for (u32 idx : order) {
         i32 v = ql[idx];
@@ -177,31 +193,49 @@ inline Payload encode_chunk(std::span<const u8> vox, const EncodeOpts& opt) {
         ts.emit_nonzero(v, context_id(sm.id[idx], prev_class)); prev_class = 1;
     }
     if (zeros) ts.emit_run(zeros, context_id(run_start_sb, prev_class));
+    a.dc = static_cast<f32>(mean);
+    a.toks = std::move(ts.toks);
+    a.ctx = std::move(ts.ctx);
+    a.counts = std::move(ts.counts);
+    a.bypass_bytes = ts.bypass.finish();
+    if (opt.tolerance > 0) a.orig.assign(vox.begin(), vox.end());
+    return a;
+}
 
-    // 5. rANS each token against its context's static histogram (§4.8). Encoding
-    // is reverse (LIFO); the context per token is replayed from ts.ctx.
-    std::array<rans::FreqTable, NUM_CTX> tbls;
-    for (u32 c = 0; c < NUM_CTX; ++c) tbls[c] = rans::FreqTable::build(ts.counts[c]);
+// Phase 2: rANS the analyzed tokens. If `shared` is non-null, code against the
+// shared tables and OMIT per-chunk table serialization (the group carries them);
+// otherwise build+serialize per-chunk tables (the independent path).
+inline Payload finalize_chunk(const ChunkAnalysis& a, const SharedTables* shared) {
+    Payload p;
+    if (a.uniform) { p.uniform = true; p.uval = a.uval; p.q = a.q; return p; }
+    p.dc = a.dc; p.q = a.q; p.steps = a.steps; p.tolerance = a.tolerance;
+    p.shared_tables = (shared != nullptr);
+
+    const std::array<rans::FreqTable, NUM_CTX>* tbls;
+    std::array<rans::FreqTable, NUM_CTX> own;
+    if (shared) tbls = &shared->tbl;
+    else { for (u32 c = 0; c < NUM_CTX; ++c) own[c] = rans::FreqTable::build(a.counts[c]); tbls = &own; }
+
     rans::Encoder enc;
-    for (i64 i = static_cast<i64>(ts.toks.size()) - 1; i >= 0; --i)
-        enc.put(tbls[ts.ctx[i]], ts.toks[i]);
+    for (i64 i = static_cast<i64>(a.toks.size()) - 1; i >= 0; --i)
+        enc.put((*tbls)[a.ctx[i]], a.toks[i]);
     auto rans_bytes = enc.finish();
 
-    Payload p;
-    p.dc = static_cast<f32>(mean);
-    p.q  = opt.q;
-    p.steps = steps;
-    p.tolerance = opt.tolerance;
-    // tokens blob = [NUM_CTX freq tables | token count | rans bytes]
-    for (u32 c = 0; c < NUM_CTX; ++c) tbls[c].serialize(p.tokens);
-    for (int i = 0; i < 4; ++i) p.tokens.push_back(u8((u32(ts.toks.size()) >> (8 * i)) & 0xff));
+    if (!shared) for (u32 c = 0; c < NUM_CTX; ++c) own[c].serialize(p.tokens);  // per-chunk tables
+    for (int i = 0; i < 4; ++i) p.tokens.push_back(u8((u32(a.toks.size()) >> (8 * i)) & 0xff));
     p.tokens.insert(p.tokens.end(), rans_bytes.begin(), rans_bytes.end());
-    p.bypass = ts.bypass.finish();
+    p.bypass = a.bypass_bytes;
+    return p;
+}
 
-    // Outlier pass (§4.6): internally decode the coefficient stream we just
-    // built, find voxels outside the L-inf tolerance, and code the sparse
-    // corrections as a second stream. Decode is unaffected beyond applying them.
-    if (opt.tolerance > 0) {
+// Encode one chunk (independent, per-chunk tables). `vox` is row-major Z,Y,X.
+inline Payload encode_chunk(std::span<const u8> vox, const EncodeOpts& opt) {
+    ChunkAnalysis a = analyze_chunk(vox, opt);
+    Payload p = finalize_chunk(a, nullptr);            // per-chunk tables
+
+    // Outlier pass (§4.6): internally decode the stream we just built, find voxels
+    // outside the L-inf tolerance, code the sparse corrections as a second stream.
+    if (opt.tolerance > 0 && !p.uniform) {
         std::vector<u8> recon(CHUNK_VOX);
         decode_chunk(p, recon);                        // recon WITHOUT corrections yet
         auto cs = outlier::find(vox, recon, opt.tolerance);
@@ -210,19 +244,56 @@ inline Payload encode_chunk(std::span<const u8> vox, const EncodeOpts& opt) {
     return p;
 }
 
+// --- Group encode (§ shared tables) ----------------------------------------
+// Encode a set of chunks sharing ONE entropy-table set. Two passes: analyze all
+// chunks (gather histograms), build the shared tables, then finalize each chunk
+// against them. Returns the shared tables (caller stores them once) + payloads.
+// Outlier pass is applied per chunk (it needs the chunk's own decode, which uses
+// the shared tables — passed through here).
+struct GroupEncoded {
+    SharedTables tables;
+    std::vector<Payload> payloads;
+};
+inline GroupEncoded encode_group(const std::vector<std::span<const u8>>& voxs,
+                                 const EncodeOpts& opt) {
+    GroupEncoded g;
+    std::vector<ChunkAnalysis> ana;
+    ana.reserve(voxs.size());
+    for (auto vox : voxs) {
+        ana.push_back(analyze_chunk(vox, opt));
+        if (!ana.back().uniform) g.tables.accumulate(ana.back().counts);
+    }
+    g.tables.build();
+    g.payloads.reserve(voxs.size());
+    for (size_t i = 0; i < ana.size(); ++i) {
+        Payload p = finalize_chunk(ana[i], ana[i].uniform ? nullptr : &g.tables);
+        if (opt.tolerance > 0 && !p.uniform) {
+            std::vector<u8> recon(CHUNK_VOX);
+            decode_chunk_shared(p, &g.tables, recon);
+            auto cs = outlier::find(voxs[i], recon, opt.tolerance);
+            p.outliers = outlier::encode(cs);
+        }
+        g.payloads.push_back(std::move(p));
+    }
+    return g;
+}
+
 // Convenience overload: encode at a plain global quality knob.
 inline Payload encode_chunk(std::span<const u8> vox, f32 q) {
     return encode_chunk(vox, EncodeOpts{.q = q});
 }
 
-// Decode one chunk payload back to a 128^3 u8 cube.
-inline void decode_chunk(const Payload& p, std::span<u8> out) {
+// Decode a chunk payload to a CHUNK^3 u8 cube. If the payload is in shared-tables
+// mode, `shared` must supply the group's tables (they're not in the payload).
+inline void decode_chunk_shared(const Payload& p, const SharedTables* shared,
+                                std::span<u8> out) {
     if (p.uniform) { std::fill(out.begin(), out.end(), p.uval); return; }  // §7 T2
 
-    // rebuild NUM_CTX freq tables + token count
     size_t pos = 0;
-    std::array<rans::FreqTable, NUM_CTX> tbls;
-    for (u32 c = 0; c < NUM_CTX; ++c) tbls[c] = rans::FreqTable::deserialize(p.tokens, pos);
+    std::array<rans::FreqTable, NUM_CTX> own;
+    const std::array<rans::FreqTable, NUM_CTX>* tbls;
+    if (p.shared_tables) { tbls = &shared->tbl; }     // tables external
+    else { for (u32 c = 0; c < NUM_CTX; ++c) own[c] = rans::FreqTable::deserialize(p.tokens, pos); tbls = &own; }
     u32 ntok = 0; for (int i = 0; i < 4; ++i) ntok |= u32(p.tokens[pos++]) << (8 * i);
     std::span<const u8> rans_bytes(p.tokens.data() + pos, p.tokens.size() - pos);
     rans::Decoder dec(rans_bytes);
@@ -240,7 +311,7 @@ inline void decode_chunk(const Payload& p, std::span<u8> out) {
         // The encoder used the subband at the run/magnitude START position; the
         // decoder is at exactly that position (oi) before consuming the token.
         u32 sb = (oi < CHUNK_VOX) ? sm.id[order[oi]] : 0;
-        u32 token = dec.get(tbls[context_id(sb, prev_class)]);
+        u32 token = dec.get((*tbls)[context_id(sb, prev_class)]);
         if (token >= RUN_BASE) {                       // zero run
             u32 rb = run_raw_bits(token);
             u32 raw = rb ? br.get(rb) : 0;
@@ -272,12 +343,18 @@ inline void decode_chunk(const Payload& p, std::span<u8> out) {
         outlier::apply(p.outliers, p.tolerance, out);
 }
 
+// Decode an independent (per-chunk-tables) payload.
+inline void decode_chunk(const Payload& p, std::span<u8> out) {
+    decode_chunk_shared(p, nullptr, out);
+}
+
 // --- payload serialization (flat blob for the archive) ---------------------
 inline std::vector<u8> Payload::serialize() const {
     std::vector<u8> b;
     // tag byte: 1 = uniform fast-path (value follows), 0 = normal payload.
+    // tag: 1=uniform, 2=normal+shared-tables (tables external), 0=normal per-chunk
     if (uniform) { b.push_back(1); b.push_back(uval); return b; }
-    b.push_back(0);
+    b.push_back(shared_tables ? u8(2) : u8(0));
     auto push32 = [&](u32 v) { for (int i = 0; i < 4; ++i) b.push_back(u8((v >> (8 * i)) & 0xff)); };
     auto pushf  = [&](f32 f) { u32 v; std::memcpy(&v, &f, 4); push32(v); };
     pushf(dc); pushf(q); pushf(tolerance);
@@ -297,6 +374,7 @@ inline Payload Payload::deserialize(std::span<const u8> bytes) {
     Payload p; size_t pos = 0;
     u8 tag = bytes[pos++];
     if (tag == 1) { p.uniform = true; p.uval = bytes[pos]; return p; }  // §7 T2
+    p.shared_tables = (tag == 2);
     auto rd32 = [&] { u32 v = 0; for (int i = 0; i < 4; ++i) v |= u32(bytes[pos++]) << (8 * i); return v; };
     auto rdf  = [&] { u32 v = rd32(); f32 f; std::memcpy(&f, &v, 4); return f; };
     p.dc = rdf(); p.q = rdf(); p.tolerance = rdf();
