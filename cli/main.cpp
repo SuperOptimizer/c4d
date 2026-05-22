@@ -1,7 +1,7 @@
 // c4d CLI — encode / decode / info / compact / bench.
-// `bench` runs the per-chunk codec across a directory of raw 128^3 u8 chunks
-// and reports PSNR + compression ratio per quality knob (the start of the §7.1
-// metric basket). encode/decode/compact are filled in as the archive lands.
+// `bench` runs the per-chunk codec across a directory of raw CHUNK^3 (64^3 by
+// default) u8 chunks and reports PSNR + compression ratio per quality knob
+// (the §7.1 metric basket). encode/decode build/read the .c4d archive.
 #include "c4d/chunk.hpp"
 #include "c4d/archive.hpp"
 #include "c4d/metrics.hpp"
@@ -280,7 +280,7 @@ static int usage() {
     std::fprintf(stderr,
         "c4d — compress4d archive tool\n"
         "usage:\n"
-        "  c4d bench  <dir-of-raw-chunks> [q ...]   benchmark codec on 128^3 chunks\n"
+        "  c4d bench  <dir-of-raw-chunks> [q ...]   benchmark codec on 64^3 chunks\n"
         "  c4d info   <archive.c4d>\n"
         "  c4d encode <raw_volume> <archive.c4d> --shape Z,Y,X [--q N]\n"
         "  c4d decode <archive.c4d> <raw_volume>\n"
