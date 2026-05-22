@@ -5,6 +5,7 @@
 #include "c4d/chunk.hpp"
 #include "c4d/archive.hpp"
 #include "c4d/metrics.hpp"
+#include "c4d/mask.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -89,6 +90,7 @@ static void write_file(const std::string& path, std::span<const u8> bytes) {
 // write a single-member intensity archive. Edge chunks zero-padded (§2).
 static int encode(int argc, char** argv) {
     Coord3 shape{}; f32 q = 16.f; std::string in, out;
+    int mask_thresh = -1;   // >=0 enables a validity mask: voxel <= thresh => invalid
     std::vector<std::string> pos;
     for (int i = 2; i < argc; ++i) {
         std::string_view a = argv[i];
@@ -98,10 +100,13 @@ static int encode(int argc, char** argv) {
                         (unsigned long long*)&shape.x);
         } else if (a == "--q" && i + 1 < argc) {
             q = std::strtof(argv[++i], nullptr);
+        } else if (a == "--mask-threshold" && i + 1 < argc) {
+            mask_thresh = std::atoi(argv[++i]);
         } else pos.push_back(std::string(a));
     }
     if (pos.size() != 2 || shape.z == 0) {
-        std::fprintf(stderr, "usage: c4d encode <raw_volume> <archive.c4d> --shape Z,Y,X [--q N]\n");
+        std::fprintf(stderr, "usage: c4d encode <raw_volume> <archive.c4d> --shape Z,Y,X "
+                             "[--q N] [--mask-threshold T]\n");
         return 2;
     }
     in = pos[0]; out = pos[1];
@@ -116,7 +121,11 @@ static int encode(int argc, char** argv) {
     u64 nchunks = g.z * g.y * g.x;
     std::vector<std::vector<u8>> payloads(nchunks);
     std::vector<f32> qs(nchunks, q);
-    std::vector<u8> cube(CHUNK_VOX);
+    std::vector<std::vector<u8>> mask_payloads;     // only if masking
+    std::vector<f32> mask_qs;
+    if (mask_thresh >= 0) { mask_payloads.resize(nchunks); mask_qs.assign(nchunks, 0.f); }
+    std::vector<u8> cube(CHUNK_VOX), valid(CHUNK_VOX);
+    u64 mask_total = 0;
     for (u64 ci = 0; ci < nchunks; ++ci) {
         Coord3 c = chunk_unravel(ci, g);
         // gather a zero-padded 128^3 cube from the volume at chunk coord c
@@ -131,20 +140,35 @@ static int encode(int argc, char** argv) {
                 any = true;
             }
         if (!any) { payloads[ci] = {}; continue; }   // fully outside -> ABSENT
+
+        if (mask_thresh >= 0) {
+            // validity grid: voxel > threshold => valid. Pad region stays invalid.
+            for (u32 i = 0; i < CHUNK_VOX; ++i) valid[i] = (cube[i] > u8(mask_thresh)) ? 1 : 0;
+            auto me = mask::encode(valid);
+            mask_payloads[ci] = me.bytes;
+            mask_total += me.bytes.size();
+        }
         payloads[ci] = chunk::encode_chunk(cube, q).serialize();
     }
     archive::Writer w;
     w.add_member("intensity", archive::MemberType::Intensity, shape, payloads, qs);
-    char meta[128];
-    std::snprintf(meta, sizeof meta, R"({"bbox":[%llu,%llu,%llu]})",
+    if (mask_thresh >= 0)
+        w.add_member("mask", archive::MemberType::ValidityMask, shape, mask_payloads, mask_qs);
+    char meta[160];
+    std::snprintf(meta, sizeof meta, R"({"bbox":[%llu,%llu,%llu]%s})",
                   (unsigned long long)shape.z, (unsigned long long)shape.y,
-                  (unsigned long long)shape.x);
+                  (unsigned long long)shape.x,
+                  mask_thresh >= 0 ? R"(,"mask":true)" : "");
     w.set_metadata(meta);
     auto file = w.finish();
     write_file(out, file);
-    std::fprintf(stderr, "encoded %llu chunks -> %s (%zu bytes, %.1fx)\n",
+    std::fprintf(stderr, "encoded %llu chunks -> %s (%zu bytes, %.1fx)%s\n",
                  (unsigned long long)nchunks, out.c_str(), file.size(),
-                 double(expect) / file.size());
+                 double(expect) / file.size(),
+                 mask_thresh >= 0 ? "" : "");
+    if (mask_thresh >= 0)
+        std::fprintf(stderr, "  + validity mask (thresh %d): %llu bytes\n",
+                     mask_thresh, (unsigned long long)mask_total);
     return 0;
 }
 
@@ -155,14 +179,24 @@ static int decode(int argc, char** argv) {
     size_t mi = r.find("intensity");
     if (mi == SIZE_MAX) { std::fprintf(stderr, "no intensity member\n"); return 1; }
     const archive::Member& m = r.member(mi);
+    size_t mk = r.find("mask");                 // optional validity mask member
     Coord3 shape = m.shape, g = chunk_grid(shape);
     std::vector<u8> vol(shape.z * shape.y * shape.x, 0);
-    std::vector<u8> cube(CHUNK_VOX);
+    std::vector<u8> cube(CHUNK_VOX), valid(CHUNK_VOX);
     for (u64 ci = 0; ci < m.index.size(); ++ci) {
         Coord3 c = chunk_unravel(ci, g);
         auto p = r.chunk_payload(mi, ci);
         if (p.empty()) std::fill(cube.begin(), cube.end(), u8(0));
         else { auto pl = chunk::Payload::deserialize(p); chunk::decode_chunk(pl, cube); }
+        // apply the validity mask (§5.3): invalid voxels forced to 0.
+        if (mk != SIZE_MAX) {
+            auto mp = r.chunk_payload(mk, ci);
+            if (mp.empty()) std::fill(cube.begin(), cube.end(), u8(0));  // no valid voxels
+            else {
+                mask::decode(mp, valid);
+                for (u32 i = 0; i < CHUNK_VOX; ++i) if (!valid[i]) cube[i] = 0;
+            }
+        }
         u64 z0 = c.z * CHUNK, y0 = c.y * CHUNK, x0 = c.x * CHUNK;
         for (u32 dz = 0; dz < CHUNK && z0 + dz < shape.z; ++dz)
             for (u32 dy = 0; dy < CHUNK && y0 + dy < shape.y; ++dy) {
