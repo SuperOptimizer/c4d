@@ -49,6 +49,23 @@ if(C4D_BUILD_CLI)
   target_link_libraries(c4d_cli PRIVATE c4d)
   set_target_properties(c4d_cli PROPERTIES OUTPUT_NAME c4d)
   c4d_tune(c4d_cli)
+
+  # zarr v2 -> .c4d converter (tools/). Reads raw zarr v2 always; blosc-
+  # compressed chunks need libblosc (auto-detected; otherwise raw-only with a
+  # clear runtime message). Modeled on vc_zarr_recompress, self-contained.
+  add_executable(zarr_to_c4d tools/zarr_to_c4d.cpp)
+  target_link_libraries(zarr_to_c4d PRIVATE c4d)
+  find_library(BLOSC_LIB blosc)
+  find_path(BLOSC_INC blosc.h)
+  if(BLOSC_LIB AND BLOSC_INC)
+    target_compile_definitions(zarr_to_c4d PRIVATE C4D_WITH_BLOSC)
+    target_include_directories(zarr_to_c4d PRIVATE ${BLOSC_INC})
+    target_link_libraries(zarr_to_c4d PRIVATE ${BLOSC_LIB})
+    message(STATUS "zarr_to_c4d: blosc support enabled (${BLOSC_LIB})")
+  else()
+    message(STATUS "zarr_to_c4d: libblosc not found — raw-zarr only")
+  endif()
+  c4d_tune(zarr_to_c4d)
 endif()
 
 # Optional head-to-head benchmark against c3d v1 (needs C3D_DIR pointing at a
@@ -74,5 +91,12 @@ if(C4D_BUILD_TESTS)
     target_link_libraries(${name} PRIVATE c4d)
     c4d_tune(${name})
     add_test(NAME ${name} COMMAND ${name})
+    # test_zarr_export drives the converter binary end-to-end: give it the path
+    # and make it depend on the binary (only when the CLI/tool is built).
+    if(name STREQUAL "test_zarr_export" AND C4D_BUILD_CLI)
+      target_compile_definitions(${name} PRIVATE
+        C4D_ZARR_TO_C4D_BIN="$<TARGET_FILE:zarr_to_c4d>")
+      add_dependencies(${name} zarr_to_c4d)
+    endif()
   endforeach()
 endif()

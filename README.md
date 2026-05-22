@@ -54,11 +54,23 @@ c4d bench   <dir-of-raw-chunks> [q ...]      # PSNR + ratio per quality knob
 `<raw_volume>` is row-major `u8` in Z,Y,X order. See [bench/RESULTS.md](bench/RESULTS.md)
 for measured quality/ratio/throughput.
 
+### zarr → .c4d
+
+`zarr_to_c4d` converts a local zarr v2 `u8` volume directly into a `.c4d`
+archive (re-tiling any source chunk shape into c4d's 64³, encoding per 256³
+region). Raw zarr always works; blosc-compressed chunks need libblosc (CMake
+auto-detects it). For a pyramid, pass the level directory.
+
+```
+zarr_to_c4d <zarr_dir> <out.c4d> [--q N] [--mask-threshold T]
+```
+
 ## Layout
 
 - `include/c4d/` — the header-only codec (DWT, quant, rANS, chunk pipeline,
   archive container, validity mask).
 - `cli/` — the `c4d` command-line tool.
+- `tools/` — `zarr_to_c4d`, the zarr v2 → `.c4d` converter.
 - `tests/` — per-module correctness tests (run via `ctest`).
 - `bench/` — the c3d head-to-head benchmark and a throughput microbench.
 
