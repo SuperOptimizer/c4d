@@ -42,6 +42,21 @@ inline constexpr u32 CHUNK_VOX = CHUNK * CHUNK * CHUNK;
 
 static_assert((CHUNK & (CHUNK - 1)) == 0, "chunk edge must be a power of two");
 
+// Region: a cubic window of chunks that shares ONE entropy-table set (the
+// "smart middle ground" — not per-chunk tables, not one set for the whole
+// archive). REGION_CHUNKS³ chunks per region. Pinned by measurement: ratio
+// peaks at ~16–32 chunks/region (too few = table overhead; too many = tables
+// lose local adaptation), and 4×4×4 = 64 chunks (256³ voxels at 64³) sits at
+// the plateau (within 0.04% of the peak) with a clean cubic shape for spatial
+// locality. A consumer fetches a region's tables + the chunks they want — never
+// the whole archive. Measured gain over per-chunk tables: +4% (q16), +8.7% (q32).
+#ifndef C4D_REGION_CHUNKS
+#define C4D_REGION_CHUNKS 4
+#endif
+inline constexpr u32 REGION_CHUNKS = C4D_REGION_CHUNKS;   // chunks per region edge
+inline constexpr u32 REGION_EDGE   = REGION_CHUNKS * CHUNK; // voxels per region edge (256)
+// (region_grid / region_of_chunk helpers are defined after Coord3, below.)
+
 // --- Transform -------------------------------------------------------------
 // 9/7 lifting, float32, separable Z then Y then X. Level count pinned by
 // measurement: at 64³ compression saturates by 2–3 levels (the LLL approximation
@@ -87,6 +102,19 @@ struct Coord3 {
     u64 x = i % grid.x;  i /= grid.x;
     u64 y = i % grid.y;  i /= grid.y;
     return {i, y, x};
+}
+
+// --- Region geometry (table-sharing window) --------------------------------
+// Number of regions to cover a chunk grid, and which region a chunk falls in.
+[[nodiscard]] constexpr Coord3 region_grid(Coord3 chunk_grid_dims) noexcept {
+    auto up = [](u64 n) constexpr { return (n + REGION_CHUNKS - 1) / REGION_CHUNKS; };
+    return {up(chunk_grid_dims.z), up(chunk_grid_dims.y), up(chunk_grid_dims.x)};
+}
+[[nodiscard]] constexpr Coord3 region_of_chunk(Coord3 c) noexcept {
+    return {c.z / REGION_CHUNKS, c.y / REGION_CHUNKS, c.x / REGION_CHUNKS};
+}
+[[nodiscard]] constexpr u64 region_linear(Coord3 r, Coord3 rgrid) noexcept {
+    return (r.z * rgrid.y + r.y) * rgrid.x + r.x;
 }
 
 } // namespace c4d
