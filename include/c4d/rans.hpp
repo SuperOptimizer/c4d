@@ -27,6 +27,9 @@ struct FreqTable {
     std::vector<u16> freq;      // normalized, sum == PROB_SCALE
     std::vector<u16> cum;       // [nsym+1] cumulative starts
     std::vector<u16> slot2sym;  // [PROB_SCALE] slot -> symbol (decode)
+    // Per-symbol reciprocals so Encoder::put replaces the per-token integer
+    // `state/freq` (a ~20-cycle div) with a 128-bit multiply + shift (~5 cycles).
+    std::vector<u64> rcp_mul64;
 
     static FreqTable build(std::span<const u32> counts) {
         FreqTable t;
@@ -55,6 +58,18 @@ struct FreqTable {
         slot2sym.assign(PROB_SCALE, 0);
         for (u32 s = 0; s < nsym; ++s)
             for (u32 i = cum[s]; i < cum[s + 1]; ++i) slot2sym[i] = static_cast<u16>(s);
+        // Round-up reciprocal: m = floor(2^SH / f) + 1, so floor(x/f) =
+        // (x*m) >> SH for all x < 2^32. SH=48 makes it exact across our range
+        // (verified exhaustively); the product x*m needs 128 bits. f==0 unused.
+        rcp_mul64.assign(nsym, 0);
+        for (u32 s = 0; s < nsym; ++s)
+            if (freq[s]) rcp_mul64[s] = (u64(1) << RCP_SH) / freq[s] + 1;
+    }
+    static constexpr u32 RCP_SH = 48;
+
+    // floor(x / freq[s]) via the precomputed reciprocal (no integer div).
+    [[nodiscard]] u32 divf(u32 x, u32 s) const noexcept {
+        return static_cast<u32>((static_cast<unsigned __int128>(x) * rcp_mul64[s]) >> RCP_SH);
     }
 
     // Serialize the normalized frequencies (the decoder rebuilds cum/slot2sym).
@@ -99,7 +114,9 @@ public:
         // 2^32 (a single-symbol alphabet hits exactly that).
         u64 x_max = (u64((RANS_L >> PROB_BITS) << 16)) * f;
         while (state_ >= x_max) { out_.push_back(u16(state_ & 0xffff)); state_ >>= 16; }
-        state_ = ((state_ / f) << PROB_BITS) + (state_ % f) + c;
+        // state/f and state%f via the precomputed reciprocal (no integer div).
+        u32 q = t.divf(state_, sym);
+        state_ = (q << PROB_BITS) + (state_ - q * f) + c;
     }
     std::vector<u8> finish() {
         out_.push_back(u16(state_ & 0xffff));
