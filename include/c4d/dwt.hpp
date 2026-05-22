@@ -24,6 +24,18 @@ namespace c4d::dwt { namespace stdx = std::experimental; }
 
 namespace c4d::dwt {
 
+// Slice (z) pitch padding (deep cache fix). The Z/Y separable passes stride by
+// CHUNK^2 floats; for CHUNK=64 that's 4096 floats = 16 KiB, an exact power of
+// two, so every voxel in a z-column maps to the same handful of L1 cache sets
+// (set-aliasing) — cachegrind measured the Z pass at 27% L1 miss vs 1.2% with a
+// padded stride (23x fewer misses). Pad the per-slice pitch by a non-power-of-2
+// so z-columns scatter across all sets. Rows stay dense (CHUNK), so x/y passes
+// and the Mallat octant packing within a slice are unchanged. The codec's
+// external buffer stays dense CHUNK_VOX; forward()/inverse() repack in and out.
+inline constexpr u32 SLICE_PAD = 8;                        // floats, non-pow2 sum
+inline constexpr u32 SLICE     = CHUNK * CHUNK + SLICE_PAD; // padded z-stride
+inline constexpr u32 PADDED_VOX = CHUNK * SLICE;           // padded buffer size
+
 // One forward lifting step over a CONTIGUOUS line `v` of length n (n even):
 // `c * (left + right)` accumulated into the target parity. The interior runs
 // branch-free; only the two boundary samples consult the mirror (x[-1]=x[1],
@@ -192,33 +204,34 @@ inline void inv_1d(f32* p, u32 n, u32 stride) noexcept {
 inline void fwd_step(f32* vol, u32 s) noexcept {
     // X axis (stride 1): VW adjacent y-rows per SIMD pass (transpose-tile), scalar
     // remainder. (Was the slowest axis — 7x the SIMD Y pass — when done scalar.)
+    // Slice base is z*SLICE (padded z-pitch); rows within a slice stay dense.
 #ifdef C4D_HAVE_SIMD
     for (u32 z = 0; z < s; ++z) {
         u32 y = 0;
-        for (; y + VW <= s; y += VW) fwd_1d_vx(vol + (z * CHUNK + y) * CHUNK, s, CHUNK);
-        for (; y < s; ++y)           fwd_1d  (vol + (z * CHUNK + y) * CHUNK, s, 1);
+        for (; y + VW <= s; y += VW) fwd_1d_vx(vol + z * SLICE + y * CHUNK, s, CHUNK);
+        for (; y < s; ++y)           fwd_1d  (vol + z * SLICE + y * CHUNK, s, 1);
     }
 #else
     for (u32 z = 0; z < s; ++z)
         for (u32 y = 0; y < s; ++y)
-            fwd_1d(vol + (z * CHUNK + y) * CHUNK, s, 1);
+            fwd_1d(vol + z * SLICE + y * CHUNK, s, 1);
 #endif
     // Y axis (stride CHUNK): VW consecutive x per SIMD pass (contiguous loads),
-    // scalar remainder. Z axis (stride CHUNK^2) likewise.
+    // scalar remainder. Z axis (stride SLICE = padded CHUNK^2) likewise.
 #ifdef C4D_HAVE_SIMD
     for (u32 z = 0; z < s; ++z) {
         u32 x = 0;
-        for (; x + VW <= s; x += VW) fwd_1d_v(vol + z * CHUNK * CHUNK + x, s, CHUNK);
-        for (; x < s; ++x)           fwd_1d  (vol + z * CHUNK * CHUNK + x, s, CHUNK);
+        for (; x + VW <= s; x += VW) fwd_1d_v(vol + z * SLICE + x, s, CHUNK);
+        for (; x < s; ++x)           fwd_1d  (vol + z * SLICE + x, s, CHUNK);
     }
     for (u32 y = 0; y < s; ++y) {
         u32 x = 0;
-        for (; x + VW <= s; x += VW) fwd_1d_v(vol + y * CHUNK + x, s, CHUNK * CHUNK);
-        for (; x < s; ++x)           fwd_1d  (vol + y * CHUNK + x, s, CHUNK * CHUNK);
+        for (; x + VW <= s; x += VW) fwd_1d_v(vol + y * CHUNK + x, s, SLICE);
+        for (; x < s; ++x)           fwd_1d  (vol + y * CHUNK + x, s, SLICE);
     }
 #else
-    for (u32 z = 0; z < s; ++z) for (u32 x = 0; x < s; ++x) fwd_1d(vol + z*CHUNK*CHUNK + x, s, CHUNK);
-    for (u32 y = 0; y < s; ++y) for (u32 x = 0; x < s; ++x) fwd_1d(vol + y*CHUNK + x, s, CHUNK*CHUNK);
+    for (u32 z = 0; z < s; ++z) for (u32 x = 0; x < s; ++x) fwd_1d(vol + z*SLICE + x, s, CHUNK);
+    for (u32 y = 0; y < s; ++y) for (u32 x = 0; x < s; ++x) fwd_1d(vol + y*CHUNK + x, s, SLICE);
 #endif
 }
 
@@ -227,46 +240,72 @@ inline void inv_step(f32* vol, u32 s) noexcept {
 #ifdef C4D_HAVE_SIMD
     for (u32 y = 0; y < s; ++y) {
         u32 x = 0;
-        for (; x + VW <= s; x += VW) inv_1d_v(vol + y * CHUNK + x, s, CHUNK * CHUNK);
-        for (; x < s; ++x)           inv_1d  (vol + y * CHUNK + x, s, CHUNK * CHUNK);
+        for (; x + VW <= s; x += VW) inv_1d_v(vol + y * CHUNK + x, s, SLICE);
+        for (; x < s; ++x)           inv_1d  (vol + y * CHUNK + x, s, SLICE);
     }
     for (u32 z = 0; z < s; ++z) {
         u32 x = 0;
-        for (; x + VW <= s; x += VW) inv_1d_v(vol + z * CHUNK * CHUNK + x, s, CHUNK);
-        for (; x < s; ++x)           inv_1d  (vol + z * CHUNK * CHUNK + x, s, CHUNK);
+        for (; x + VW <= s; x += VW) inv_1d_v(vol + z * SLICE + x, s, CHUNK);
+        for (; x < s; ++x)           inv_1d  (vol + z * SLICE + x, s, CHUNK);
     }
 #else
-    for (u32 y = 0; y < s; ++y) for (u32 x = 0; x < s; ++x) inv_1d(vol + y*CHUNK + x, s, CHUNK*CHUNK);
-    for (u32 z = 0; z < s; ++z) for (u32 x = 0; x < s; ++x) inv_1d(vol + z*CHUNK*CHUNK + x, s, CHUNK);
+    for (u32 y = 0; y < s; ++y) for (u32 x = 0; x < s; ++x) inv_1d(vol + y*CHUNK + x, s, SLICE);
+    for (u32 z = 0; z < s; ++z) for (u32 x = 0; x < s; ++x) inv_1d(vol + z*SLICE + x, s, CHUNK);
 #endif
     // X axis (stride 1): VW adjacent y-rows per SIMD pass, scalar remainder.
 #ifdef C4D_HAVE_SIMD
     for (u32 z = 0; z < s; ++z) {
         u32 y = 0;
-        for (; y + VW <= s; y += VW) inv_1d_vx(vol + (z * CHUNK + y) * CHUNK, s, CHUNK);
-        for (; y < s; ++y)           inv_1d  (vol + (z * CHUNK + y) * CHUNK, s, 1);
+        for (; y + VW <= s; y += VW) inv_1d_vx(vol + z * SLICE + y * CHUNK, s, CHUNK);
+        for (; y < s; ++y)           inv_1d  (vol + z * SLICE + y * CHUNK, s, 1);
     }
 #else
     for (u32 z = 0; z < s; ++z)
         for (u32 y = 0; y < s; ++y)
-            inv_1d(vol + (z * CHUNK + y) * CHUNK, s, 1);
+            inv_1d(vol + z * SLICE + y * CHUNK, s, 1);
 #endif
 }
 
+// Per-thread padded scratch (slice-pitched, see SLICE). Reused across calls so
+// the repack adds no allocation. The two repack copies are sequential CHUNK^2
+// runs (cache-friendly) and are paid back many times over by the strided
+// Z/Y-pass miss reduction.
+[[nodiscard]] inline f32* padded_scratch() noexcept {
+    thread_local std::vector<f32> buf(PADDED_VOX);
+    return buf.data();
+}
+
+// Repack dense CHUNK^3 (z*CHUNK^2 + y*CHUNK + x) <-> slice-padded (z*SLICE + ...).
+// Rows are dense in both, so each slice is one contiguous CHUNK^2-float copy.
+inline void pack_padded(const f32* dense, f32* pad) noexcept {
+    for (u32 z = 0; z < CHUNK; ++z)
+        std::memcpy(pad + z * SLICE, dense + z * CHUNK * CHUNK, CHUNK * CHUNK * sizeof(f32));
+}
+inline void unpack_padded(const f32* pad, f32* dense) noexcept {
+    for (u32 z = 0; z < CHUNK; ++z)
+        std::memcpy(dense + z * CHUNK * CHUNK, pad + z * SLICE, CHUNK * CHUNK * sizeof(f32));
+}
+
 // Full multi-level forward transform over a CHUNK^3 buffer. Each level halves
-// the active sub-cube (recursing into the LLL octant), `levels` deep.
+// the active sub-cube (recursing into the LLL octant), `levels` deep. Transforms
+// in the slice-padded scratch to avoid Z/Y-stride cache-set aliasing.
 inline void forward(f32* vol, u32 levels = DWT_LEVELS) noexcept {
+    f32* pad = padded_scratch();
+    pack_padded(vol, pad);
     u32 s = CHUNK;
-    for (u32 l = 0; l < levels; ++l) { fwd_step(vol, s); s /= 2; }
+    for (u32 l = 0; l < levels; ++l) { fwd_step(pad, s); s /= 2; }
+    unpack_padded(pad, vol);
 }
 
 // Full multi-level inverse transform (coarsest level first).
 inline void inverse(f32* vol, u32 levels = DWT_LEVELS) noexcept {
-    // Recompute the sub-cube size at the coarsest level, then grow back.
+    f32* pad = padded_scratch();
+    pack_padded(vol, pad);
     std::array<u32, 16> sizes{};
     u32 s = CHUNK;
     for (u32 l = 0; l < levels; ++l) { sizes[l] = s; s /= 2; }
-    for (i32 l = static_cast<i32>(levels) - 1; l >= 0; --l) inv_step(vol, sizes[static_cast<u32>(l)]);
+    for (i32 l = static_cast<i32>(levels) - 1; l >= 0; --l) inv_step(pad, sizes[static_cast<u32>(l)]);
+    unpack_padded(pad, vol);
 }
 
 } // namespace c4d::dwt
