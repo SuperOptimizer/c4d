@@ -20,16 +20,16 @@ using f32 = float;
 using f64 = double;
 
 // --- Geometry (spec §2, frozen) -------------------------------------------
+// The chunk is the only structural unit: codec atom AND random-access unit.
+// Shards (a 2048^3 object-grouping unit) were dropped — the single-file archive
+// + footer index (§5/§6) is the I/O unit, so the shard's only purpose (avoiding
+// S3 LIST storms over a million small chunk-files) no longer exists. Prefetch
+// locality, if wanted, is a write-time payload ordering hint (Morton/Z-order),
+// not a format structure.
 inline constexpr u32 CHUNK   = 128;            // codec atom edge, voxels
-inline constexpr u32 SHARD   = 2048;           // I/O grouping edge, voxels
 inline constexpr u32 CHUNK_VOX = CHUNK * CHUNK * CHUNK;          // 2,097,152
-inline constexpr u32 CHUNKS_PER_SHARD_EDGE = SHARD / CHUNK;      // 16
-inline constexpr u32 CHUNKS_PER_SHARD = CHUNKS_PER_SHARD_EDGE
-                                      * CHUNKS_PER_SHARD_EDGE
-                                      * CHUNKS_PER_SHARD_EDGE;    // 4096
 
 static_assert(CHUNK == 128 && (CHUNK & (CHUNK - 1)) == 0, "chunk must be 128 = 2^7");
-static_assert(SHARD % CHUNK == 0, "shard must be a whole number of chunks");
 
 // --- Transform (spec §4.1) -------------------------------------------------
 // 9/7 lifting, float32, separable Z then Y then X. Level count: 128 = 2^7

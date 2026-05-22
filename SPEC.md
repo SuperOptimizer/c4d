@@ -29,7 +29,7 @@ future change is itself a fresh ground-up rewrite.
   language features where they don't cost performance.
 - **Heavily `constexpr` / `consteval`.** Everything that can be computed at
   compile time is: wavelet lifting coefficients, quantization/dead-zone tables,
-  subband geometry, scan orders, rANS table scaffolding, the chunk/shard grid
+  subband geometry, scan orders, rANS table scaffolding, the chunk-grid
   arithmetic. Runtime does only the data-dependent work.
 - **SIMD, CPU-only.** No GPU. Portable SIMD (std::simd where available, or
   intrinsics behind a thin abstraction). `-ffast-math` is acceptable
@@ -80,16 +80,25 @@ maximized at the others' expense.
 
 ## 2. Geometry
 
-- **Chunk:** always **128³** voxels. The codec atom — one encode/decode call.
-  Decoded whole; never partially decoded.
-- **Shard:** always **2048³** voxels = 16³ = 4096 chunks. The I/O / S3-object
-  grouping unit.
+- **Chunk:** always **128³** voxels. The **only** structural unit — both the
+  codec atom (one encode/decode call, decoded whole, never partially) **and** the
+  random-access unit (range-GET any chunk by its index entry). 
 - **Archive:** one `.c4d` file containing one or more members (§5), footer-indexed.
-- Edge chunks/shards are **padded to full 128³ / 2048³** with **zero** fill. The
-  codec and format always deal in full-size chunks/shards.
+  This is the I/O unit.
+- Edge chunks are **padded to full 128³** with **zero** fill. The codec and
+  format always deal in full-size chunks.
 - The **logical** volume extent is recorded as a **bounding box** in metadata
   (§5.4); padding may exist on any of the ±Z, ±Y, ±X faces. Cropping to the
   logical volume is a consumer operation using the bbox.
+
+> **No shards.** Earlier drafts had a 2048³ "shard" as an S3-object grouping
+> unit. The single-file archive + footer index (§5/§6) **is** the I/O unit, so
+> the shard's only purpose — avoiding `LIST` storms over a million tiny
+> chunk-files — no longer exists. There is exactly one structural unit (the
+> chunk) plus the archive. Prefetch locality, if a consumer wants a big
+> sequential read over a region, is a **write-time payload ordering hint**
+> (concatenate chunks in Morton/Z-order so adjacent chunks are contiguous and
+> the consumer coalesces their ranges) — not a format structure.
 
 ### 2.1 Why 128³ (settled)
 
