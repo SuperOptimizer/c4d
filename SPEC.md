@@ -575,6 +575,37 @@ computed after one IDWT per chunk for the offline sweep table.
 > GMSD/HaarPSI reward recovered detail while the MS-SSIM floor stops it running
 > away into noise.
 
+### 7.2 Ratio/quality frontier — measured exhausted (2026-05)
+
+A systematic ceiling analysis found the achievable RD frontier is reached:
+
+- **Entropy coding is maxed.** c4d's shipped payload sits **within 0.25%** of the
+  full per-coefficient causal-neighbor-significance context ceiling (240,666 B vs
+  240,063 B on a q16 chunk). The clustered 6-context model (§4.8) already captures
+  essentially all the conditioning gain a full EBCOT-style context could give. A
+  separate significance-map + magnitude scheme is *worse* (325 KB) — confirming
+  "model the zeros" via runs beats a sig-map here.
+- **Cross-chunk redundancy is negligible.** 128³ chunks are large enough that the
+  inter-chunk DC spread is tiny (~10/255 over 8 neighbors) and intra-chunk
+  structure is already captured by the DWT — a cross-chunk predictor would save
+  ~4 bytes per ~190 KB chunk.
+- **Perceptual reweighting loses on its own basket.** Emphasizing HF bits (to feed
+  GMSD/HaarPSI) at matched rate *lowers* geomean (0.871→0.865 at 8×) — the basket
+  still penalizes the added noise. MSE-optimal L2 weighting wins even perceptually.
+- **Longer wavelet — analyzed, declined.** The one untested structural lever.
+  Likely +2–5% compaction on smooth regions, but offset by (a) more ringing on the
+  sharp air/material boundaries that dominate the corpus, (b) worse chunk-face
+  seams (longer filter contaminates more of the seam), (c) a direct hit on the
+  already-bottlenecked DWT, and (d) it's a frozen-format change. Net upside
+  marginal/negative on high-contrast scroll data; keep 9/7.
+
+Conclusion: the gains came from **structural coding** (zero-run §4.7, context
+§4.8) and **overhead elimination** (uniform fast-path); the quantizer/transform
+frontier is at its practical optimum for this corpus. Further ratio/quality would
+require either a different data regime or relaxing a hard constraint (e.g. the
+independent-chunk requirement, which blocks lapped transforms and cross-chunk
+prediction).
+
 ---
 
 ## Appendix: rejected alternatives (do not reopen)
