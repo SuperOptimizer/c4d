@@ -113,10 +113,12 @@ Earlier drafts used independent 128³ chunks. After **relaxing chunk independenc
   sits on the plateau (within 0.04% of the peak) with a clean cubic shape for
   spatial locality. 32³ chunks add a few % more ratio but **64× the chunk count**
   (index/seam/metadata all blow up) — 64³ is the sweet spot.
-- **Net measured win** of 64³ + region-shared tables + spatial-neighbor context
-  (§4.8) over the old per-chunk 128³: **+10–14% ratio at identical quality**
-  (q16 7.7×→8.45×, q32 15.2×→17.3×). This made c4d **tie-or-beat c3d v1 on ratio
-  while staying ~2× faster** — the first ratio gain past the v1 frontier.
+- **Net measured win** of 64³ + region-shared tables over the old per-chunk 128³:
+  **~+5–8% ratio at identical quality** from amortising the per-chunk entropy-table
+  overhead across a region. (A spatial-neighbour context axis added another ~5% but
+  was **removed** — it cost 25–35% encode/decode throughput; speed-prioritised.
+  A subband-order scan permutation added ~3% but was also removed — ~10–14%
+  tokengen cost from the random-gather indirection. See §4.8.)
 
 64³ also gives 8× finer random access and an 8× cheaper cold neighbor-fetch.
 16³ remains a **post-decode in-memory cache** granularity, not a codec unit.
@@ -145,8 +147,9 @@ What was **measured and rejected** as cross-chunk levers (the per-chunk DWT
 decorrelates too well — neighbor coefficient correlation ≈ 0): cross-chunk
 coefficient prediction, cross-chunk context, DC prediction (≈ 20 bytes/volume),
 trained dictionaries (a context model beats a real zstd dictionary on our token
-stream). The relaxation's real value is **shared tables + spatial-neighbor
-context**, not exotic cross-chunk coding.
+stream); and the **spatial-neighbour context** + **subband-order scan** (small
+ratio, too much compute — see §4.8). The relaxation's real value is the
+**region-shared entropy tables**, which cost ~nothing at decode.
 
 No internal LODs / progressive coding: c4d encodes **one volume at one
 resolution**; pyramids are separate archives/members (OME-Zarr style).
@@ -290,31 +293,37 @@ each zero as its own rANS symbol wastes both bits and decode cycles.
   magnitude-bucket *token* (rANS) + raw mantissa bits (bypass) + sign. Keeps the
   rANS alphabet small and histograms sharp.
 
-### 4.8 Context modeling (SHIPPED — spatial-neighbour context)
+### 4.8 Context modeling (SHIPPED — 6 contexts; richer axes measured-and-removed)
 
 Past the zeroth-order floor, ratio comes from conditioning the rANS model on a
-small context. **30 static histograms**, one per context id:
+small context. **6 static histograms**, one per context id:
 
-  **context = level-bucket {0,1,2+} × prev-token-class {run,mag} ×
-  neighbour-magnitude bucket {0,1,2,3,4}**
+  **context = level-bucket {0,1,2+} × prev-token-class {run,mag}**
 
-where the neighbour bucket comes from the sum of `|causal same-subband spatial
-neighbours (−z,−y,−x)|` (EBCOT/SPIHT significance context). Neighbours are
-restricted to the **same subband** so they are guaranteed already-decoded in the
-subband-raster scan — encode and decode derive the context identically, no
-desync. Static-per-region histograms keep decode SIMD (per-symbol switching is
+Cheap (two integer ops, no memory gathers) and worth **~13%** vs a single global
+table. Static-per-region histograms keep decode SIMD (per-symbol switching is
 just "point at another table" in rANS — cheap, unlike tANS/FSE table rebuild).
+Coefficients are scanned in **linear raster order** (the subband id per voxel is
+a fixed `constexpr` table, so no permutation is needed to know each token's
+context).
 
-- **Measured (data-driven, our corpus):** the spatial-neighbour axis is **−4.3 to
-  −4.9%** smaller vs the old (level × prev-class) context; +parent adds only ~1%
-  more for 5× the states, so **parent was dropped**. The neighbour-context win
-  **beat a real zstd dictionary** on our token stream (order-1 context 6.43 MB <
-  zstd-19 6.84 MB < order-0 7.42 MB — the wavelet+quant destroys the literal
-  repetition a dictionary needs; conditioning beats it and is cheaper).
-- **Critical coupling:** the 30-context model only pays **with region-shared
-  tables** (§3). Per-chunk it is *worse* — 30 serialized tables per 64³ chunk
-  swamp the gain. Shared tables + neighbour context ship together; combined they
-  give **+10–14%** over the per-chunk baseline.
+Two richer axes were measured and **removed** — both were small-ratio / high-cost
+for a speed-prioritised codec (the data drove the cut):
+
+- **Spatial-neighbour magnitude axis** (EBCOT/SPIHT: context also keyed on the
+  sum of causal same-subband neighbour magnitudes). Measured **~+5% ratio** (and
+  it beat a real zstd dictionary — wavelet+quant destroys the literal repetition
+  a dictionary needs) **but cost 25–35% encode/decode throughput** from per-token
+  strided neighbour gathers. Removed.
+- **Subband-order scan permutation** (visit coefficients subband-contiguously so
+  zero-runs coalesce across the Mallat layout). Measured **~+3% ratio but ~10–14%
+  tokengen cost** from the random-gather `order[]` indirection. Removed; linear
+  raster scan instead.
+
+Both were the only "small ratio for real compute" features; everything that
+remains is cheap-and-high-ratio (the 6-context model, run/EOB coding) or
+structural. The shipped ratio win from relaxing independence is the **region-
+shared tables** (§3), which cost ~nothing at decode.
 
 ### 4.9 Entropy engine + transform implementation (speed)
 
