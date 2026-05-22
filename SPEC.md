@@ -195,11 +195,20 @@ independence, and costs nothing at decode.
 > of masked/invalid voxels. That is a separate matter from the *transform's*
 > internal boundary handling, which is mirror extension. Do not conflate them.
 
-*Optional encoder-side overlap (HQ mode):* to further suppress inter-chunk seams,
-the encoder may transform each chunk from a small halo (e.g. 4–8 voxels/face) read
-from neighbors and crop to the 128³ core. The decoder remains fully independent
-(it discards nothing it didn't receive). Only the encoder needs neighbor voxels
-(it has the whole volume). Small ratio tax; off by default.
+*Encoder-side overlap (HQ mode) — investigated, NOT shipped.* Inter-chunk seams
+are real and measured (error-jump across a chunk face is ~1.5–2.2× the interior,
+growing with q). But the obvious fixes don't work for an **independent-chunk
+mirror-DWT** codec: (a) the forward/inverse boundary must stay *matched* for
+perfect reconstruction, so the encoder cannot feed neighbor data into only the
+forward boundary taps (it would not invert under the decoder's mirror inverse —
+verified); (b) preconditioning the input by blending boundary voxels toward the
+neighbor *worsens* the seam (it moves the stored value off the truth — measured,
+q8 ratio 1.5→5.4). A genuine overlap/cropping halo is a **lapped transform**,
+which requires a decoder-side inverse lap and so breaks the independent-chunk
+random-access model (a hard requirement, §3). Conclusion: the ~1.5–2.2× seam
+factor is the inherent, accepted cost of independent tiling (exactly JPEG2000's
+per-tile behavior); mirror extension remains the right choice. Revisit only if
+the random-access requirement is ever relaxed.
 
 ### 4.5 Unit-L2 normalization (REQUIRED)
 
