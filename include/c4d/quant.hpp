@@ -13,6 +13,7 @@
 #include <array>
 #include <cmath>
 #include <span>
+#include <vector>
 #if __has_include(<experimental/simd>)
 #  include <experimental/simd>
 #  define C4D_QUANT_SIMD 1
@@ -78,6 +79,15 @@ struct SubbandMap {
     return m;
 }
 
+// Reusable per-thread scratch for the per-voxel step field — avoids a 256 KB
+// heap alloc + zero-fill on every quantize/dequantize call (measured in the asm
+// as an operator new/delete + memset per call). Thread-local keeps the codec
+// reentrant/thread-safe (each calling thread gets its own buffer).
+inline f32* step_scratch() noexcept {
+    thread_local std::vector<f32> buf(CHUNK_VOX);
+    return buf.data();
+}
+
 // Per-voxel quantizer step for the current StepTable, materialized into a flat
 // array so the dead-zone loop is a contiguous SIMD pass (no per-voxel table
 // indirection). The subband id per voxel is fixed geometry; only the 40 step
@@ -94,7 +104,7 @@ inline void build_step_field(const StepTable& t, std::span<f32> field) noexcept 
 // Quantize a whole transformed cube into integer levels using the step table.
 inline void quantize(std::span<const f32> coeffs, const StepTable& t,
                      std::span<i32> out) noexcept {
-    std::vector<f32> step(CHUNK_VOX);
+    std::span<f32> step(step_scratch(), CHUNK_VOX);
     build_step_field(t, step);
 #ifdef C4D_QUANT_SIMD
     // Work entirely in the float domain (masks are native to vf), produce a
@@ -125,7 +135,7 @@ inline void quantize(std::span<const f32> coeffs, const StepTable& t,
 // Dequantize integer levels back to coefficients (out = q * step, mid-tread).
 inline void dequantize(std::span<const i32> q, const StepTable& t,
                        std::span<f32> out) noexcept {
-    std::vector<f32> step(CHUNK_VOX);
+    std::span<f32> step(step_scratch(), CHUNK_VOX);
     build_step_field(t, step);
 #ifdef C4D_QUANT_SIMD
     namespace stdx = std::experimental;

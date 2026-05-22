@@ -25,6 +25,22 @@
 
 namespace c4d::chunk {
 
+// Per-thread scratch arena for the fixed-size per-chunk working buffers (the
+// CHUNK³ coefficient/level/recon arrays). Allocated once per thread and reused
+// across every encode/decode call on that thread — eliminates the ~1 MB
+// (coef) + ~1 MB (ql) + 256 KB (recon) heap allocations that otherwise happen on
+// every chunk. Thread-local => the codec stays reentrant/thread-safe (each
+// calling thread has its own arena; callers parallelize across chunks/threads).
+struct Scratch {
+    std::vector<f32> coef{std::vector<f32>(CHUNK_VOX)};   // DWT coefficient buffer
+    std::vector<i32> ql{std::vector<i32>(CHUNK_VOX)};     // quantized levels
+    std::vector<u8>  recon{std::vector<u8>(CHUNK_VOX)};   // outlier-pass recon
+};
+[[nodiscard]] inline Scratch& scratch() noexcept {
+    thread_local Scratch s;
+    return s;
+}
+
 // Token alphabet layout. Magnitude tokens occupy [0, RUN_BASE); run tokens
 // occupy [RUN_BASE, RUN_BASE + RUN_TOKENS).
 inline constexpr u32 RUN_BASE   = hybrid::MAX_TOKEN;     // 64
@@ -175,7 +191,8 @@ inline ChunkAnalysis analyze_chunk(std::span<const u8> vox, const EncodeOpts& op
       for (u8 v : vox) if (v != v0) { uni = false; break; }
       if (uni) { a.uniform = true; a.uval = v0; return a; } }
 
-    std::vector<f32> coef(CHUNK_VOX);
+    std::vector<f32>& coef = scratch().coef;     // per-thread reusable scratch
+    std::vector<i32>& ql   = scratch().ql;
     f64 mean = 0; for (u8 v : vox) mean += v; mean /= CHUNK_VOX;
     for (u32 i = 0; i < CHUNK_VOX; ++i) coef[i] = static_cast<f32>(vox[i]) - static_cast<f32>(mean);
     dwt::forward(coef.data());
@@ -183,7 +200,6 @@ inline ChunkAnalysis analyze_chunk(std::span<const u8> vox, const EncodeOpts& op
     f64 sigma = (opt.noise_aware || opt.perceptual_rdo) ? estimate_noise_sigma(coef) : 0.0;
     if (opt.noise_aware)   a.steps = NoiseShrink::analyze(coef).apply(a.steps, opt.shrink_strength);
     if (opt.perceptual_rdo) a.steps = PerceptualRDO::apply(a.steps, vox, sigma, opt.rdo_strength);
-    std::vector<i32> ql(CHUNK_VOX);
     quantize(coef, a.steps, ql);
 
     TokenStream ts;
@@ -246,7 +262,7 @@ inline Payload encode_chunk(std::span<const u8> vox, const EncodeOpts& opt) {
     // Outlier pass (§4.6): internally decode the stream we just built, find voxels
     // outside the L-inf tolerance, code the sparse corrections as a second stream.
     if (opt.tolerance > 0 && !p.uniform) {
-        std::vector<u8> recon(CHUNK_VOX);
+        std::span<u8> recon(scratch().recon);
         decode_chunk(p, recon);                        // recon WITHOUT corrections yet
         auto cs = outlier::find(vox, recon, opt.tolerance);
         p.outliers = outlier::encode(cs);
@@ -278,7 +294,7 @@ inline GroupEncoded encode_group(const std::vector<std::span<const u8>>& voxs,
     for (size_t i = 0; i < ana.size(); ++i) {
         Payload p = finalize_chunk(ana[i], ana[i].uniform ? nullptr : &g.tables);
         if (opt.tolerance > 0 && !p.uniform) {
-            std::vector<u8> recon(CHUNK_VOX);
+            std::span<u8> recon(scratch().recon);
             decode_chunk_shared(p, &g.tables, recon);
             auto cs = outlier::find(voxs[i], recon, opt.tolerance);
             p.outliers = outlier::encode(cs);
@@ -312,7 +328,8 @@ inline void decode_chunk_shared(const Payload& p, const SharedTables* shared,
     // Reconstruct quantized levels in linear raster order (matching encode).
     const SubbandMap& sm = subband_map();
 
-    std::vector<i32> ql(CHUNK_VOX, 0);
+    std::vector<i32>& ql = scratch().ql;   // reused scratch; zero the skipped runs
+    std::fill(ql.begin(), ql.end(), 0);
     u32 oi = 0;            // linear position
     u32 prev_class = 1;    // matches the encoder's initial prev_class
     for (u32 t = 0; t < ntok; ++t) {
@@ -338,7 +355,7 @@ inline void decode_chunk_shared(const Payload& p, const SharedTables* shared,
 
     // dequantize with the steps carried in the chunk (§4.1), inverse DWT, add
     // DC, clamp to u8.
-    std::vector<f32> coef(CHUNK_VOX);
+    std::vector<f32>& coef = scratch().coef;
     dequantize(ql, p.steps, coef);
     dwt::inverse(coef.data());
     for (u32 i = 0; i < CHUNK_VOX; ++i) {
