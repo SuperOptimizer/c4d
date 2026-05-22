@@ -147,16 +147,27 @@ private:
 // Plain LSB-first bit packing. Optimal for uniform data and trivially fast.
 class BitWriter {
 public:
+    BitWriter() { out_.reserve(1 << 16); }     // avoid early reallocs
+    // Append nbits (<=32) of `bits`, LSB-first. Flushes whole 32-bit words when
+    // the 64-bit accumulator can hold no more, in one memcpy-friendly push —
+    // avoids the per-byte push_back loop that dominated tokengen.
     void put(u32 bits, u32 nbits) {
+        if (nfill_ + nbits > 64) flush32();    // keep room (nbits<=32 => fits after)
         acc_ |= u64(bits & ((nbits < 32) ? ((1u << nbits) - 1) : 0xffffffffu)) << nfill_;
         nfill_ += nbits;
-        while (nfill_ >= 8) { out_.push_back(u8(acc_ & 0xff)); acc_ >>= 8; nfill_ -= 8; }
     }
     std::vector<u8> finish() {
+        while (nfill_ >= 8) { out_.push_back(u8(acc_ & 0xff)); acc_ >>= 8; nfill_ -= 8; }
         if (nfill_ > 0) { out_.push_back(u8(acc_ & 0xff)); acc_ = 0; nfill_ = 0; }
         return std::move(out_);
     }
 private:
+    void flush32() {                            // emit the low 32 bits as 4 bytes
+        u32 w = static_cast<u32>(acc_);
+        out_.push_back(u8(w)); out_.push_back(u8(w >> 8));
+        out_.push_back(u8(w >> 16)); out_.push_back(u8(w >> 24));
+        acc_ >>= 32; nfill_ -= 32;
+    }
     std::vector<u8> out_;
     u64 acc_ = 0;
     u32 nfill_ = 0;
@@ -166,15 +177,24 @@ class BitReader {
 public:
     explicit BitReader(std::span<const u8> bytes) : data_(bytes) {}
     u32 get(u32 nbits) {
-        while (nfill_ < nbits) {
-            u8 b = (pos_ < data_.size()) ? data_[pos_] : 0; ++pos_;
-            acc_ |= u64(b) << nfill_; nfill_ += 8;
-        }
+        if (nfill_ < nbits) refill();          // pull in a whole word at once
         u32 v = static_cast<u32>(acc_ & ((nbits < 32) ? ((1u << nbits) - 1) : 0xffffffffu));
         acc_ >>= nbits; nfill_ -= nbits;
         return v;
     }
 private:
+    void refill() {                            // top up the accumulator (nbits<=32)
+        if (pos_ + 4 <= data_.size()) {        // fast path: one 32-bit load
+            u32 w = data_[pos_] | (u32(data_[pos_+1]) << 8)
+                  | (u32(data_[pos_+2]) << 16) | (u32(data_[pos_+3]) << 24);
+            acc_ |= u64(w) << nfill_; nfill_ += 32; pos_ += 4;
+        } else {
+            while (nfill_ <= 56 && pos_ < data_.size()) {
+                acc_ |= u64(data_[pos_++]) << nfill_; nfill_ += 8;
+            }
+            if (pos_ >= data_.size()) nfill_ = 64;   // pad with zeros past EOF
+        }
+    }
     std::span<const u8> data_;
     size_t pos_ = 0;
     u64 acc_ = 0;

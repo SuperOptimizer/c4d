@@ -64,12 +64,14 @@ inline constexpr u32 NUM_CTX = NLEV * NPC * NNB;   // 30
 // (a different-subband neighbor may be scanned later → encode/decode desync).
 [[nodiscard]] inline u32 causal_neigh_sum(const std::vector<i32>& ql,
                                           const SubbandMap& sm, u32 idx) noexcept {
-    u32 x = idx % CHUNK, y = (idx / CHUNK) % CHUNK, z = idx / (CHUNK * CHUNK);
-    u8 id = sm.id[idx];
+    // CHUNK is a power of two; derive the on-face tests with masks, no div/mod.
+    constexpr u32 PLANE = CHUNK * CHUNK;
+    const i32* q = ql.data(); const u8* id = sm.id.data();
+    u8 c = id[idx];
     u32 s = 0;
-    if (x && sm.id[idx - 1] == id)               s += static_cast<u32>(std::abs(ql[idx - 1]));
-    if (y && sm.id[idx - CHUNK] == id)           s += static_cast<u32>(std::abs(ql[idx - CHUNK]));
-    if (z && sm.id[idx - CHUNK * CHUNK] == id)   s += static_cast<u32>(std::abs(ql[idx - CHUNK * CHUNK]));
+    if ((idx & (CHUNK - 1))   && id[idx - 1]     == c) s += static_cast<u32>(std::abs(q[idx - 1]));
+    if ((idx & (PLANE - 1)) >= CHUNK && id[idx - CHUNK] == c) s += static_cast<u32>(std::abs(q[idx - CHUNK]));
+    if (idx >= PLANE && id[idx - PLANE] == c)          s += static_cast<u32>(std::abs(q[idx - PLANE]));
     return s;
 }
 
