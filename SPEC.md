@@ -506,15 +506,40 @@ basket on *dense* interior where 'noise' is fiber texture; situational for
 sparse/air-adjacent regions); (d) **outlier pass** (§4.6) — hard point-wise-error,
 verified exact (t=1→max_err 1, ~0.15% outliers).
 
-**T2 — Measure-then-add (partial):** static context map (§4.8) **DONE and shipped**
-— clustered to 6 contexts (level-bucket × prev-class), measured ~10% smaller at
-equal quality, ~14% decode cost. Still deferred: bivariate parent-child shrinkage;
-perceptual/energy-preserving RDO; TCQ; uniform-block air fast-path.
+**T2 — Measure-then-add (all measured):**
+- **static context map (§4.8) — SHIPPED.** 6 contexts (level-bucket × prev-class),
+  ~10% smaller at equal quality, ~14% decode cost.
+- **uniform-block fast-path — SHIPPED.** Constant chunks code to 2 bytes (tag +
+  value) instead of ~1.7 KB of table overhead; lossless, q-independent.
+- **perceptual/energy-preserving RDO (§4.10) — implemented, OFF by default.**
+  Coherence-gated HF preservation; measured neutral-to-negative at matched rate
+  (slides along the frontier, doesn't bend it).
+- **bivariate parent-child shrinkage (§4.10) — measured-and-skipped.** A fine-grid
+  RD sweep shows all shrinkage variants slide along the frontier here; bivariate
+  is the same mechanism ⇒ same frontier ⇒ no gain.
+- **TCQ — built as an experiment, NOT shipped.** The ceiling estimate said
+  ~0.5-0.7 dB, but the realized 4-state coset implementation *loses* at matched
+  rate (+0.2-0.35 dB for +0.3-0.8 bits/coeff — a net loss): the simplified
+  coset-storage doesn't reproduce Marcellin's exact union-index coding where the
+  trellis bit is ~0.5 bit and the level entropy drops below fine-scalar. The
+  correct bitstream is a major frozen-format undertaking with uncertain payoff
+  given this corpus's already-optimal frontier. `tcq.hpp` kept as a measured
+  reference; revisit only with the exact index coding if a future corpus shows
+  frontier slack.
 
-**Other deferred:** DWT level count (pinned at 5); mask neighbor-occupancy context
-+ planar-mode (§5.3 steps 2–3 — the octree→DAG core is done); fused-lifting +
-block-interleaved rANS if the speed/ratio balance shifts; whole-volume aggregate
-ratio + memory-footprint measurements.
+**Other deferred:** mask neighbor-occupancy + planar-mode (§5.3 steps 2-3 —
+**measured-and-skipped**: the gap-rANS DAG is already within 0.7% of entropy;
+clean masks collapse via the DAG, noisy masks are node-count-bound and fixed by
+lossy dilation, not per-node coding); fused-lifting + interleaved/block SIMD rANS
+(the punted speed pass); whole-volume aggregate ratio + memory-footprint measurements.
+
+> **Recurring lesson (5 measured-skip results: diagonal scan, noise-aware, RDO,
+> bivariate, TCQ-as-built):** the baseline RD frontier is already near-optimal on
+> the scroll corpus — the unit-L2 per-subband weighting (§4.5) plus zero-run +
+> context coding capture the available gains. Encoder-side quantizer/step tweaks
+> slide along the frontier rather than bend it. The wins that *stuck* were
+> structural coding (zero-run §4.7, context §4.8) and overhead elimination
+> (uniform fast-path), not quantization cleverness.
 
 ### 7.1 Encoder objective — the balanced metric basket
 
