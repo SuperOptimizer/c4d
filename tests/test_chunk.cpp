@@ -76,10 +76,12 @@ int main() {
         bool all_zero = true; for (u8 v : rec) if (v) all_zero = false;
         CHECK(all_zero);
         std::fprintf(stderr, "  all-zero chunk: %zu B\n", blob.size());
-        // Near-empty: a single zero-run token. Bytes are fixed overhead — the
-        // serialized freq table (128-symbol alphabet ~256B) + the per-subband
-        // step table (40 floats = 160B) — not coefficient data.
-        CHECK(blob.size() < 512);
+        // Near-empty: a single zero-run token. Bytes are fixed overhead — NUM_CTX
+        // serialized freq tables (§4.8, 128-symbol alphabet each) + the per-
+        // subband step table — not coefficient data. (In an archive such a chunk
+        // is marked ABSENT and carries no payload at all, so this overhead is
+        // never actually stored; it only appears for a standalone encode.)
+        CHECK(blob.size() < 2048);
     }
 
     RUN_TESTS_RETURN();

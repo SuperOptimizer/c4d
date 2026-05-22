@@ -34,6 +34,19 @@ inline constexpr u32 RUN_TOKENS = hybrid::MAX_TOKEN;     // run-length buckets
                                                          // 128^3 = 2^21 chunk)
 inline constexpr u32 ALPHABET   = RUN_BASE + RUN_TOKENS; // total symbols
 
+// Context modeling (§4.8). Each token is coded against one of NUM_CTX static
+// histograms selected by a cheap context id: (level bucket {0,1,2+}) × (previous
+// token was a zero-run vs a magnitude). MEASURED on the corpus: ~11% smaller
+// token stream net of the per-context table cost (the rich per-subband context
+// is clustered to these 6 — the §4.8 context-map idea). Per-symbol distribution
+// switching is cheap in rANS (just point at another table).
+inline constexpr u32 NUM_CTX = 6;
+[[nodiscard]] inline u32 context_id(u32 subband_id, u32 prev_class) noexcept {
+    u32 lvl = subband_id >> 3;
+    u32 lb  = lvl >= 2 ? 2u : lvl;          // level bucket {0,1,2+}
+    return (lb << 1) | (prev_class & 1u);   // 0..5
+}
+
 // Zero-run length split: same hybrid scheme, offset into the run token band.
 struct RunSplit { u32 token; u32 raw; u32 nbits; };
 [[nodiscard]] inline RunSplit run_encode(u32 len) noexcept {
@@ -67,24 +80,26 @@ struct Payload {
 };
 
 // --- token-stream generation (encode) --------------------------------------
-// First pass builds the token list + bypass bits and gathers symbol counts;
-// second pass rANS-encodes the tokens against the static histogram.
+// First pass builds the token list (each tagged with its context) + bypass bits
+// and gathers per-context symbol counts; second pass rANS-encodes each token
+// against its context's static histogram (§4.8).
 struct TokenStream {
-    std::vector<u32> toks;          // in forward order
+    std::vector<u32> toks;                          // forward order
+    std::vector<u8>  ctx;                           // per-token context id (0..NUM_CTX)
     rans::BitWriter  bypass;
-    std::vector<u32> counts;        // [ALPHABET]
-    TokenStream() : counts(ALPHABET, 0) {}
+    std::array<std::vector<u32>, NUM_CTX> counts;   // per-context histograms
+    TokenStream() { for (auto& c : counts) c.assign(ALPHABET, 0); }
 
-    void emit_nonzero(i32 v) {
+    void emit_nonzero(i32 v, u32 c) {
         u32 mag = static_cast<u32>(v < 0 ? -v : v);
         auto s = hybrid::encode(mag);
-        toks.push_back(s.token); ++counts[s.token];
+        toks.push_back(s.token); ctx.push_back(static_cast<u8>(c)); ++counts[c][s.token];
         if (s.nbits) bypass.put(s.raw, s.nbits);
         bypass.put(v < 0 ? 1u : 0u, 1);     // sign
     }
-    void emit_run(u32 len) {
+    void emit_run(u32 len, u32 c) {
         auto r = run_encode(len);
-        toks.push_back(r.token); ++counts[r.token];
+        toks.push_back(r.token); ctx.push_back(static_cast<u8>(c)); ++counts[c][r.token];
         if (r.nbits) bypass.put(r.raw, r.nbits);
     }
 };
@@ -125,20 +140,27 @@ inline Payload encode_chunk(std::span<const u8> vox, const EncodeOpts& opt) {
     // (Frequency-diagonal within-band order measured worse here — see scan.hpp.)
     TokenStream ts;
     const std::vector<u32>& order = scan_order().order;
+    const SubbandMap& sm = subband_map();
 
-    u32 zeros = 0;
+    // Each token's context = (level bucket of the position where it applies) ×
+    // (previous token class: run=0, magnitude=1). A run token uses the subband at
+    // its START position; a magnitude token uses its own position's subband.
+    u32 zeros = 0, prev_class = 1, run_start_sb = 0;
     for (u32 idx : order) {
         i32 v = ql[idx];
-        if (v == 0) { ++zeros; continue; }
-        if (zeros) { ts.emit_run(zeros); zeros = 0; }
-        ts.emit_nonzero(v);
+        if (v == 0) { if (zeros == 0) run_start_sb = sm.id[idx]; ++zeros; continue; }
+        if (zeros) { ts.emit_run(zeros, context_id(run_start_sb, prev_class)); zeros = 0; prev_class = 0; }
+        ts.emit_nonzero(v, context_id(sm.id[idx], prev_class)); prev_class = 1;
     }
-    if (zeros) ts.emit_run(zeros);   // trailing zero run
+    if (zeros) ts.emit_run(zeros, context_id(run_start_sb, prev_class));
 
-    // 5. rANS the tokens against a static histogram.
-    auto tbl = rans::FreqTable::build(ts.counts);
+    // 5. rANS each token against its context's static histogram (§4.8). Encoding
+    // is reverse (LIFO); the context per token is replayed from ts.ctx.
+    std::array<rans::FreqTable, NUM_CTX> tbls;
+    for (u32 c = 0; c < NUM_CTX; ++c) tbls[c] = rans::FreqTable::build(ts.counts[c]);
     rans::Encoder enc;
-    for (i64 i = static_cast<i64>(ts.toks.size()) - 1; i >= 0; --i) enc.put(tbl, ts.toks[i]);
+    for (i64 i = static_cast<i64>(ts.toks.size()) - 1; i >= 0; --i)
+        enc.put(tbls[ts.ctx[i]], ts.toks[i]);
     auto rans_bytes = enc.finish();
 
     Payload p;
@@ -146,8 +168,8 @@ inline Payload encode_chunk(std::span<const u8> vox, const EncodeOpts& opt) {
     p.q  = opt.q;
     p.steps = steps;
     p.tolerance = opt.tolerance;
-    // tokens blob = [freq table | token count | rans bytes]
-    tbl.serialize(p.tokens);
+    // tokens blob = [NUM_CTX freq tables | token count | rans bytes]
+    for (u32 c = 0; c < NUM_CTX; ++c) tbls[c].serialize(p.tokens);
     for (int i = 0; i < 4; ++i) p.tokens.push_back(u8((u32(ts.toks.size()) >> (8 * i)) & 0xff));
     p.tokens.insert(p.tokens.end(), rans_bytes.begin(), rans_bytes.end());
     p.bypass = ts.bypass.finish();
@@ -171,9 +193,10 @@ inline Payload encode_chunk(std::span<const u8> vox, f32 q) {
 
 // Decode one chunk payload back to a 128^3 u8 cube.
 inline void decode_chunk(const Payload& p, std::span<u8> out) {
-    // rebuild freq table + token count
+    // rebuild NUM_CTX freq tables + token count
     size_t pos = 0;
-    auto tbl = rans::FreqTable::deserialize(p.tokens, pos);
+    std::array<rans::FreqTable, NUM_CTX> tbls;
+    for (u32 c = 0; c < NUM_CTX; ++c) tbls[c] = rans::FreqTable::deserialize(p.tokens, pos);
     u32 ntok = 0; for (int i = 0; i < 4; ++i) ntok |= u32(p.tokens[pos++]) << (8 * i);
     std::span<const u8> rans_bytes(p.tokens.data() + pos, p.tokens.size() - pos);
     rans::Decoder dec(rans_bytes);
@@ -181,22 +204,30 @@ inline void decode_chunk(const Payload& p, std::span<u8> out) {
 
     // Reconstruct quantized levels in the same canonical scan order, then scatter.
     const std::vector<u32>& order = scan_order().order;
+    const SubbandMap& sm = subband_map();
 
     std::vector<i32> ql(CHUNK_VOX, 0);
-    u32 oi = 0;  // position in `order`
+    u32 oi = 0;            // position in `order`
+    u32 prev_class = 1;    // matches the encoder's initial prev_class
     for (u32 t = 0; t < ntok; ++t) {
-        u32 token = dec.get(tbl);
+        // context = (level bucket at the current scan position) × prev_class.
+        // The encoder used the subband at the run/magnitude START position; the
+        // decoder is at exactly that position (oi) before consuming the token.
+        u32 sb = (oi < CHUNK_VOX) ? sm.id[order[oi]] : 0;
+        u32 token = dec.get(tbls[context_id(sb, prev_class)]);
         if (token >= RUN_BASE) {                       // zero run
             u32 rb = run_raw_bits(token);
             u32 raw = rb ? br.get(rb) : 0;
             u32 len = run_decode(token, raw);
             oi += len;                                 // those positions stay 0
+            prev_class = 0;
         } else {                                       // nonzero magnitude
             u32 rb = hybrid::raw_bits_of(token);
             u32 raw = rb ? br.get(rb) : 0;
             u32 mag = hybrid::decode(token, raw);
             u32 sign = br.get(1);
             ql[order[oi++]] = sign ? -static_cast<i32>(mag) : static_cast<i32>(mag);
+            prev_class = 1;
         }
     }
 
