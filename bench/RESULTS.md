@@ -82,3 +82,21 @@ Measured on cmp256/p172_a.raw (256³ = one region), single-thread, matched by ra
 faster** single-thread. The +10–14% v2 ratio gain over per-chunk 64³ closed the
 small gap c3d v1 had. Net: c4d v2 is the better codec on ratio, quality (tied),
 and speed (~2×).
+
+## v2 speed pass (profile-guided, no SIMD-rANS needed)
+
+Profiling a 64³ chunk showed tokengen/detok dominate (~56-66%), NOT the DWT,
+and rANS itself is cheap (~15% of decode). Three profile-guided optimizations,
+all byte-exact (no ratio change):
+- **X-axis DWT SIMD** (was scalar, 7× the SIMD Y/Z cost): transpose-tile VW
+  y-rows → lane-major lift. DWT fwd 1.3→0.72 ms, inv 1.3→0.67 ms.
+- **Bypass bit I/O**: BitWriter flushes 32-bit words (not per-byte push_back) +
+  reserve; BitReader refills a word per top-up. Emit path ~21% faster.
+- **Branchless causal-neighbour sum**: power-of-2 mask boundary tests, raw ptrs.
+
+Net single-thread (per 64³ chunk): **encode 44→51 MB/s, decode 54→64 MB/s**
+(~25-35% over the start of the pass; ~8-15× over the original scalar baseline).
+Remaining cost is inherent: the spatial-neighbour context's strided gathers
+(~1.3 ms/side) — a ratio↔speed tradeoff we keep (it's a shipped +5% ratio win),
+not a code inefficiency. Interleaved SIMD rANS deemed unnecessary (rANS is only
+~15% of decode). Single-threaded thread-safe; callers parallelize across chunks.
