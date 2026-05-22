@@ -65,3 +65,20 @@ scalar rANS (last un-SIMD'd hot stage) + cutting memory passes.
 Caveat: c4d at 128³ pays a fixed per-chunk overhead (freq table ~256B + step
 table 160B) ⇒ 8 chunks/256³ carry it 8×; negligible on dense data but a known
 target for a shared/default-table optimization.
+
+## v2 update (64³ chunks + 256³ region-shared tables + spatial-neighbor context)
+
+Relaxing chunk independence (encode reads 26 uncompressed neighbors, decode reads
+26 compressed) enabled region-shared entropy tables + spatial-neighbor context.
+Measured on cmp256/p172_a.raw (256³ = one region), single-thread, matched by ratio:
+
+| quality | c3d v1 | c4d v2 | speed (c4d enc/dec vs c3d) |
+|--------:|-------:|-------:|---------------------------|
+| ~40.4 dB | 5.4× | **5.4×** (tied) | 442/382 ms vs 694/521 |
+| ~35.4 dB | 10.2× | 9.9× | 311/268 ms vs 570/435 |
+| ~32.7 dB | 15.2× | 14.5× | 278/228 ms vs 531/404 |
+
+**c4d v2 ties-or-beats c3d on ratio** (v1 was slightly behind) **and is ~1.8–2×
+faster** single-thread. The +10–14% v2 ratio gain over per-chunk 64³ closed the
+small gap c3d v1 had. Net: c4d v2 is the better codec on ratio, quality (tied),
+and speed (~2×).

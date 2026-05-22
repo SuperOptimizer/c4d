@@ -80,57 +80,83 @@ maximized at the others' expense.
 
 ## 2. Geometry
 
-- **Chunk:** always **128³** voxels. The **only** structural unit — both the
-  codec atom (one encode/decode call, decoded whole, never partially) **and** the
-  random-access unit (range-GET any chunk by its index entry). 
+- **Chunk:** always **64³** voxels. The codec atom (one encode/decode call,
+  decoded whole) and the finest random-access unit.
+- **Region:** a **4×4×4-chunk = 256³-voxel** cube. The **table-sharing and
+  partial-fetch unit**: all chunks in a region share one entropy-table set (§4.8),
+  and a consumer fetches *a region's tables + the chunks it wants* — not the whole
+  archive. (See §2.1 for why 64³+region, §3 for the relaxed-independence model.)
 - **Archive:** one `.c4d` file containing one or more members (§5), footer-indexed.
-  This is the I/O unit.
-- Edge chunks are **padded to full 128³** with **zero** fill. The codec and
-  format always deal in full-size chunks.
+  This is the file/object I/O unit.
+- Edge chunks are **padded to full 64³** with **zero** fill; edge regions hold
+  fewer than 64 present chunks. The codec always deals in full-size chunks.
 - The **logical** volume extent is recorded as a **bounding box** in metadata
-  (§5.4); padding may exist on any of the ±Z, ±Y, ±X faces. Cropping to the
-  logical volume is a consumer operation using the bbox.
+  (§5.4); cropping to it is a consumer operation.
 
-> **No shards.** Earlier drafts had a 2048³ "shard" as an S3-object grouping
-> unit. The single-file archive + footer index (§5/§6) **is** the I/O unit, so
-> the shard's only purpose — avoiding `LIST` storms over a million tiny
-> chunk-files — no longer exists. There is exactly one structural unit (the
-> chunk) plus the archive. Prefetch locality, if a consumer wants a big
-> sequential read over a region, is a **write-time payload ordering hint**
-> (concatenate chunks in Morton/Z-order so adjacent chunks are contiguous and
-> the consumer coalesces their ranges) — not a format structure.
+> **No shards.** A single-file archive + footer index (§5/§6) is the I/O unit; the
+> old 2048³ "shard" (an S3-object grouping unit) had no remaining purpose and was
+> dropped. The structural units are **chunk** (codec atom) and **region** (table-
+> sharing + fetch granularity), plus the archive.
 
-### 2.1 Why 128³ (settled)
+### 2.1 Why 64³ chunks + 256³ regions (measured, settled)
 
-Measured independent-unit compression cost vs. one-256³-unit, at matched quality:
-128³ = +6%, 64³ = +16%, 32³ = +39%, 16³ = +86%. 256³→128³ captures ~90% of the
-random-access benefit (~8× less decode-whole-to-use-part waste; ~10ms→~1ms per
-chunk) at only +6% bytes. Two-tier transforms, adaptive-octree chunking, and
-partial/sub-chunk decode were explored and **rejected** — a few more % for
-permanent frozen-in complexity. Fine spatial access (e.g. a parametric-surface
-sheet through a chunk) is served by decoding the whole 128³ (~2 MB, ~1 ms) and
-slicing in memory. 16³ is a **post-decode in-memory cache** granularity, not a
-codec unit.
+Earlier drafts used independent 128³ chunks. After **relaxing chunk independence**
+(§3), measurement reversed the chunk-size choice:
+
+- Per-chunk *coefficient* entropy is actually **lower** at 64³ than 128³ (smaller
+  chunks adapt local statistics better). The only thing that penalized small
+  chunks was the **per-chunk entropy-table overhead** — and once chunks share
+  tables across a region (possible only without strict independence), that
+  overhead amortizes away.
+- **Region-size sweep:** ratio peaks at 16–32 chunks/region (too few = table
+  overhead; too many = tables lose local adaptation). **4×4×4 = 64 chunks (256³)**
+  sits on the plateau (within 0.04% of the peak) with a clean cubic shape for
+  spatial locality. 32³ chunks add a few % more ratio but **64× the chunk count**
+  (index/seam/metadata all blow up) — 64³ is the sweet spot.
+- **Net measured win** of 64³ + region-shared tables + spatial-neighbor context
+  (§4.8) over the old per-chunk 128³: **+10–14% ratio at identical quality**
+  (q16 7.7×→8.45×, q32 15.2×→17.3×). This made c4d **tie-or-beat c3d v1 on ratio
+  while staying ~2× faster** — the first ratio gain past the v1 frontier.
+
+64³ also gives 8× finer random access and an 8× cheaper cold neighbor-fetch.
+16³ remains a **post-decode in-memory cache** granularity, not a codec unit.
 
 ---
 
-## 3. Chunks are independent
+## 3. Chunks depend on neighbors (relaxed independence)
 
-Each 128³ chunk is **fully self-contained**: it decodes alone, no dependency on
-neighbors. Required by the random-access model (range-GET any chunk); worth its
-small ratio cost. No internal LODs, multi-resolution, progressive/embedded
-coding, or resolution-ordered subbands. c4d encodes **one volume at one
-resolution.** Pyramids are built **outside** c4d as separate archives/members
-(OME-Zarr style); the LOD relationship is a consumer-side naming/metadata
-convention. (Accepted cost: ~1.14× pyramid storage tax vs. progressive — parity
-with OME-Zarr, bought for simplicity and S3-friendliness.)
+c4d **relaxes pure chunk independence** for a measured ratio/quality gain, within
+a deliberate "smart middle ground": a consumer never needs the whole archive, but
+also does not get pure single-chunk random access for free.
+
+- **Encode** of a chunk may read its 26 spatial neighbors' **uncompressed**
+  voxels (the encoder has the whole volume).
+- **Decode** of a chunk may read its 26 spatial neighbors' **compressed** payloads.
+- **Region-shared entropy tables** are the concrete payoff (§4.8): chunks in a
+  256³ region share one table set, so the per-chunk table overhead is paid once
+  per region instead of per chunk. To decode any chunk a consumer fetches its
+  region's table blob (one small cached fetch) + the chunk payload(s).
+- **Streaming model:** consumers progressively download and cache; fetching a
+  256³ region (tables + its chunks) is the working unit. Neighbors needed for a
+  region's interior are *within the same region* (already fetched); only a
+  region's outer rind touches the next region.
+
+What was **measured and rejected** as cross-chunk levers (the per-chunk DWT
+decorrelates too well — neighbor coefficient correlation ≈ 0): cross-chunk
+coefficient prediction, cross-chunk context, DC prediction (≈ 20 bytes/volume),
+trained dictionaries (a context model beats a real zstd dictionary on our token
+stream). The relaxation's real value is **shared tables + spatial-neighbor
+context**, not exotic cross-chunk coding.
+
+No internal LODs / progressive coding: c4d encodes **one volume at one
+resolution**; pyramids are separate archives/members (OME-Zarr style).
 
 ---
 
 ## 4. Codec pipeline (per chunk)
 
 ```
-u8 128³  ─▶  subtract DC/mean  ─▶  9/7 float32 DWT (mirror-extended, separable Z,Y,X)
+u8 64³   ─▶  subtract DC/mean  ─▶  9/7 float32 DWT (mirror-extended, separable Z,Y,X)
          ─▶  (encoder-side: noise-aware dead-zone shrinkage)
          ─▶  dead-zone quantize (per-subband step, L2-weighted)
          ─▶  zero-run/EOB + rANS entropy code  ─▶  chunk payload bytes
@@ -180,7 +206,7 @@ payload); everything constant is pushed to archive-level metadata (§5.4).
 
 ### 4.4 Chunk-face boundary handling (REQUIRED: mirror extension)
 
-Independent 128³ chunks are a *tiling* of the volume, and tiling a wavelet codec
+Independent 64³ chunks are a *tiling* of the volume, and tiling a wavelet codec
 with **zero-padding at chunk faces** is the textbook recipe for JPEG2000-style
 tiling artifacts: the zero step at each face injects a large artificial edge →
 spurious high-frequency coefficients → wasted bits + ringing. **The 9/7 lifting
@@ -264,25 +290,31 @@ each zero as its own rANS symbol wastes both bits and decode cycles.
   magnitude-bucket *token* (rANS) + raw mantissa bits (bypass) + sign. Keeps the
   rANS alphabet small and histograms sharp.
 
-### 4.8 Context modeling (recommended; measure win-vs-speed before committing)
+### 4.8 Context modeling (SHIPPED — spatial-neighbour context)
 
 Past the zeroth-order floor, ratio comes from conditioning the rANS model on a
-small context. Use a **context map**: compute a rich context id per symbol, then
-cluster to a small set (8–16) of **static** histograms via a signalled map — the
-multi-context benefit without per-context table cost. Per-symbol distribution
-switching is **cheap in rANS** (point at a different frequency table) but
-expensive in tANS/FSE (table rebuild) — a key reason to keep rANS.
+small context. **30 static histograms**, one per context id:
 
-- **Context = subband id × coarse bucket of `max(|neighbours|, |parent|)`** —
-  neighbour-significance (EBCOT) plus cross-subband parent (zerotree), as rANS
-  contexts, *not* a SPIHT tree.
-- Organize the symbol stream **by subband** so contexts change in block-aligned
-  runs (cheap) rather than per-symbol (which forces a SIMD gather).
-- Measured ceiling for the neighbour-significance axis alone ≈ 5–7%; full
-  magnitude+parent+subband context is reportedly more (≈10–30% in wavelet coders).
-  Each context axis costs ≈ 25% decode throughput — hence "measure before
-  committing," and fund it with engine throughput (§4.9). If shipped, it is part
-  of the frozen bitstream.
+  **context = level-bucket {0,1,2+} × prev-token-class {run,mag} ×
+  neighbour-magnitude bucket {0,1,2,3,4}**
+
+where the neighbour bucket comes from the sum of `|causal same-subband spatial
+neighbours (−z,−y,−x)|` (EBCOT/SPIHT significance context). Neighbours are
+restricted to the **same subband** so they are guaranteed already-decoded in the
+subband-raster scan — encode and decode derive the context identically, no
+desync. Static-per-region histograms keep decode SIMD (per-symbol switching is
+just "point at another table" in rANS — cheap, unlike tANS/FSE table rebuild).
+
+- **Measured (data-driven, our corpus):** the spatial-neighbour axis is **−4.3 to
+  −4.9%** smaller vs the old (level × prev-class) context; +parent adds only ~1%
+  more for 5× the states, so **parent was dropped**. The neighbour-context win
+  **beat a real zstd dictionary** on our token stream (order-1 context 6.43 MB <
+  zstd-19 6.84 MB < order-0 7.42 MB — the wavelet+quant destroys the literal
+  repetition a dictionary needs; conditioning beats it and is cheaper).
+- **Critical coupling:** the 30-context model only pays **with region-shared
+  tables** (§3). Per-chunk it is *worse* — 30 serialized tables per 64³ chunk
+  swamp the gain. Shared tables + neighbour context ship together; combined they
+  give **+10–14%** over the per-chunk baseline.
 
 ### 4.9 Entropy engine + transform implementation (speed)
 
@@ -575,20 +607,25 @@ computed after one IDWT per chunk for the offline sweep table.
 > GMSD/HaarPSI reward recovered detail while the MS-SSIM floor stops it running
 > away into noise.
 
-### 7.2 Ratio/quality frontier — measured exhausted (2026-05)
+### 7.2 Ratio/quality frontier — the v1 wall and the v2 breakthrough
 
-A systematic ceiling analysis found the achievable RD frontier is reached:
+The *independent-128³* frontier was measured exhausted, and the way past it was
+to **relax independence** (which §7.2 originally predicted: "further ratio would
+require relaxing a hard constraint — the independent-chunk requirement"). That is
+exactly the v2 architecture (§2.1, §3): 64³ chunks + 256³ region-shared tables +
+spatial-neighbor context = **+10–14%** past the v1 wall.
 
-- **Entropy coding is maxed.** c4d's shipped payload sits **within 0.25%** of the
-  full per-coefficient causal-neighbor-significance context ceiling (240,666 B vs
-  240,063 B on a q16 chunk). The clustered 6-context model (§4.8) already captures
-  essentially all the conditioning gain a full EBCOT-style context could give. A
-  separate significance-map + magnitude scheme is *worse* (325 KB) — confirming
-  "model the zeros" via runs beats a sig-map here.
-- **Cross-chunk redundancy is negligible.** 128³ chunks are large enough that the
-  inter-chunk DC spread is tiny (~10/255 over 8 neighbors) and intra-chunk
-  structure is already captured by the DWT — a cross-chunk predictor would save
-  ~4 bytes per ~190 KB chunk.
+The original v1 ceiling findings (still true *under independence*):
+
+- **Entropy coding was maxed under per-chunk independence** — the shipped
+  per-chunk payload sat within 0.25% of the full neighbor-significance ceiling
+  *with per-chunk tables*. v2 broke past it not by better per-chunk coding but by
+  **amortizing the table overhead across a region** and adding the
+  **spatial-neighbor context** (which only pays once tables are shared, §4.8).
+- **Cross-chunk *coefficient* redundancy is negligible** — the per-chunk DWT
+  decorrelates so well that cross-chunk coefficient prediction / context measure
+  ≈ 0, and a trained dictionary loses to a context model. The relaxation's value
+  is shared *tables* + neighbor *context*, not cross-chunk coefficient coding.
 - **Perceptual reweighting loses on its own basket.** Emphasizing HF bits (to feed
   GMSD/HaarPSI) at matched rate *lowers* geomean (0.871→0.865 at 8×) — the basket
   still penalizes the added noise. MSE-optimal L2 weighting wins even perceptually.
