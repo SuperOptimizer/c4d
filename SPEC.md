@@ -326,8 +326,15 @@ params for MAE/MSE, which over-smooths and discards HF edge detail. c4d targets 
   quality together** on noisy scans (the corpus-confirmed hard case), and it is
   *compression efficiency*, not denoising of the stored signal (c4d still stores
   what it is given; it just declines to spend bits coding sub-noise-floor
-  coefficients). Optionally add bivariate (parent-child) shrinkage for higher
-  quality, reusing the §4.8 parent access.
+  coefficients). Bivariate (parent-child / Sendur-Selesnick) shrinkage was a
+  candidate refinement here — **measured-and-skipped**: marginal shrinkage,
+  perceptual RDO, *and* a fine-grid sweep all show the same thing — shrinkage
+  variants slide ALONG the RD frontier on this corpus, they don't bend it (the
+  unit-L2 weighting is already near-optimal, §4.5). Denoise's (ratio, geomean)
+  points interpolate exactly onto the baseline curve. Bivariate is a refinement
+  of the same shrinkage mechanism, so it would land on the same frontier — no
+  gain to chase. (It IS off-by-default-useful for higher quality-at-fixed-q, as
+  the shipped marginal noise-aware mode already provides.)
 - **Perceptual / energy-preserving RDO.** Bias the per-subband step / per-chunk q
   from a cheap per-block weight: loosen quant in high-variance regions (masking),
   and add a per-subband **HF-energy-preservation** penalty that discourages
