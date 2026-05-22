@@ -202,13 +202,15 @@ inline ChunkAnalysis analyze_chunk(std::span<const u8> vox, const EncodeOpts& op
     std::vector<f32>& coef = scratch().coef;     // per-thread reusable scratch
     std::vector<i32>& ql   = scratch().ql;
     // One pass over the u8 cube: widen to f32 into coef AND accumulate the sum.
-    // (Was two passes — a sum pass then a widen-subtract pass.) The DC subtract
-    // is a second cheap f32-only pass once the mean is known.
+    // The DC subtract is folded into dwt::forward's pack copy (bias arg) — it
+    // had to read coef there anyway, so the separate `coef[i] -= mean` pass
+    // (a full 256K read+write that missed L1 since coef was already evicted) is
+    // gone. Subtracting a constant before a linear transform == doing it during
+    // the pack, so the transformed output is byte-identical.
     f64 sum = 0;
     for (u32 i = 0; i < CHUNK_VOX; ++i) { f32 f = static_cast<f32>(vox[i]); coef[i] = f; sum += f; }
     f32 mean = static_cast<f32>(sum / CHUNK_VOX);
-    for (u32 i = 0; i < CHUNK_VOX; ++i) coef[i] -= mean;
-    dwt::forward(coef.data());
+    dwt::forward(coef.data(), mean);
     a.steps = StepTable::from_q(opt.q);
     f64 sigma = (opt.noise_aware || opt.perceptual_rdo) ? estimate_noise_sigma(coef) : 0.0;
     if (opt.noise_aware)   a.steps = NoiseShrink::analyze(coef).apply(a.steps, opt.shrink_strength);
@@ -417,10 +419,34 @@ inline void decode_chunk_shared(const Payload& p, const SharedTables* shared,
     std::vector<f32>& coef = scratch().coef;
     dequantize(ql, p.steps, coef);
     dwt::inverse(coef.data());
-    for (u32 i = 0; i < CHUNK_VOX; ++i) {
-        f32 v = coef[i] + p.dc;
+    // Add DC, round, clamp to [0,255], narrow to u8. This was the single hottest
+    // line in the codec (~11% of decode instructions) when scalar — the nested
+    // ternary + per-element f32->u8 narrowing didn't auto-vectorize. SIMD: add,
+    // min/max clamp, round-half-up, cast f32->i32->u8.
+    const f32 dc = p.dc;
+#ifdef C4D_CHUNK_SIMD
+    namespace stdx = std::experimental;
+    using vf = stdx::native_simd<f32>;
+    using vi = stdx::rebind_simd_t<i32, vf>;
+    using vu8 = stdx::rebind_simd_t<u8, vf>;
+    constexpr u32 W = vf::size();
+    u32 i = 0;
+    for (; i + W <= CHUNK_VOX; i += W) {
+        vf v = vf(&coef[i], stdx::element_aligned) + dc;
+        v = stdx::min(stdx::max(v + 0.5f, vf(0.f)), vf(255.f));   // round-half-up + clamp
+        vu8 b = stdx::static_simd_cast<vu8>(stdx::static_simd_cast<vi>(v));
+        b.copy_to(&out[i], stdx::element_aligned);
+    }
+    for (; i < CHUNK_VOX; ++i) {
+        f32 v = coef[i] + dc;
         out[i] = static_cast<u8>(v < 0.f ? 0.f : (v > 255.f ? 255.f : v + 0.5f));
     }
+#else
+    for (u32 i = 0; i < CHUNK_VOX; ++i) {
+        f32 v = coef[i] + dc;
+        out[i] = static_cast<u8>(v < 0.f ? 0.f : (v > 255.f ? 255.f : v + 0.5f));
+    }
+#endif
 
     // Apply the optional outlier corrections (§4.6) -> hard |z - x| <= t.
     if (p.tolerance > 0 && !p.outliers.empty())
