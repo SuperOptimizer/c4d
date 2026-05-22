@@ -35,44 +35,21 @@ inline constexpr u32 RUN_TOKENS = hybrid::MAX_TOKEN;     // run-length buckets
                                                          // 128^3 = 2^21 chunk)
 inline constexpr u32 ALPHABET   = RUN_BASE + RUN_TOKENS; // total symbols
 
-// Context modeling (§4.8). Each token is coded against a static histogram chosen
-// by a cheap context id. v2 context (DATA-DRIVEN, measured on the corpus):
-//   level-bucket {0,1,2+}  ×  prev-token-class {run,mag}  ×  neighbor-magnitude
-//   bucket {0,1,2,3,4}  (sum of |causal spatial neighbors -z,-y,-x|, EBCOT/SPIHT)
-// The spatial-neighbor axis is the canonical wavelet context and measured
-// -4.3..-4.9% smaller vs the old (level×prev-class) model — it BEAT a real zstd
-// dictionary on our data. Neighbors are causal (already decoded in subband-raster
-// order), so encode and decode derive the context identically. Static-per-region
-// tables keep decode SIMD (just point at another table per symbol).
+// Context modeling (§4.8). Each token is coded against one of NUM_CTX static
+// histograms selected by a cheap context id: level-bucket {0,1,2+} × prev-token-
+// class {run,mag}. Per-symbol distribution switching is cheap in rANS (just point
+// at another table). A spatial-neighbour-magnitude axis was tried (EBCOT/SPIHT)
+// and measured ~5% smaller, but it cost ~25-35% encode/decode throughput (per-
+// token strided neighbour gathers) — a bad trade for a speed-prioritised codec,
+// so it was removed. This 6-context model is the shipped one.
 inline constexpr u32 NLEV = 3;    // level buckets {0,1,2+}
 inline constexpr u32 NPC  = 2;    // prev-token class {run, mag}
-inline constexpr u32 NNB  = 5;    // neighbor-magnitude buckets
-inline constexpr u32 NUM_CTX = NLEV * NPC * NNB;   // 30
+inline constexpr u32 NUM_CTX = NLEV * NPC;          // 6
 
-[[nodiscard]] inline u32 neigh_bucket(u32 nsum) noexcept {
-    return nsum == 0 ? 0u : nsum < 2 ? 1u : nsum < 4 ? 2u : nsum < 8 ? 3u : 4u;
-}
-[[nodiscard]] inline u32 context_id(u32 subband_id, u32 prev_class, u32 nbucket) noexcept {
+[[nodiscard]] inline u32 context_id(u32 subband_id, u32 prev_class) noexcept {
     u32 lvl = subband_id >> 3;
     u32 lb  = lvl >= 2 ? 2u : lvl;                  // level bucket {0,1,2+}
-    return ((lb * NPC + (prev_class & 1u)) * NNB) + nbucket;   // 0..29
-}
-
-// Sum of |causal spatial neighbors| (−z, −y, −x in the transformed cube) at a
-// linear index, counting ONLY same-subband neighbors. Restricting to the same
-// subband guarantees those neighbors are already decoded in subband-raster scan
-// (a different-subband neighbor may be scanned later → encode/decode desync).
-[[nodiscard]] inline u32 causal_neigh_sum(const std::vector<i32>& ql,
-                                          const SubbandMap& sm, u32 idx) noexcept {
-    // CHUNK is a power of two; derive the on-face tests with masks, no div/mod.
-    constexpr u32 PLANE = CHUNK * CHUNK;
-    const i32* q = ql.data(); const u8* id = sm.id.data();
-    u8 c = id[idx];
-    u32 s = 0;
-    if ((idx & (CHUNK - 1))   && id[idx - 1]     == c) s += static_cast<u32>(std::abs(q[idx - 1]));
-    if ((idx & (PLANE - 1)) >= CHUNK && id[idx - CHUNK] == c) s += static_cast<u32>(std::abs(q[idx - CHUNK]));
-    if (idx >= PLANE && id[idx - PLANE] == c)          s += static_cast<u32>(std::abs(q[idx - PLANE]));
-    return s;
+    return lb * NPC + (prev_class & 1u);            // 0..5
 }
 
 // Zero-run length split: same hybrid scheme, offset into the run token band.
@@ -213,21 +190,19 @@ inline ChunkAnalysis analyze_chunk(std::span<const u8> vox, const EncodeOpts& op
     TokenStream ts;
     const std::vector<u32>& order = scan_order().order;
     const SubbandMap& sm = subband_map();
-    // Context per token: subband level × prev-class × causal-neighbor-magnitude
-    // bucket. A run token uses the subband+neighbors at its START position; a
-    // magnitude token uses its own position. Neighbors are causal (decoded).
-    u32 zeros = 0, prev_class = 1, run_start_sb = 0, run_start_nb = 0;
+    // Context per token: subband level × prev-token-class. A run token uses the
+    // subband at its START position; a magnitude token uses its own position.
+    u32 zeros = 0, prev_class = 1, run_start_sb = 0;
     for (u32 idx : order) {
         i32 v = ql[idx];
         if (v == 0) {
-            if (zeros == 0) { run_start_sb = sm.id[idx]; run_start_nb = neigh_bucket(causal_neigh_sum(ql, sm, idx)); }
+            if (zeros == 0) run_start_sb = sm.id[idx];
             ++zeros; continue;
         }
-        if (zeros) { ts.emit_run(zeros, context_id(run_start_sb, prev_class, run_start_nb)); zeros = 0; prev_class = 0; }
-        u32 nb = neigh_bucket(causal_neigh_sum(ql, sm, idx));
-        ts.emit_nonzero(v, context_id(sm.id[idx], prev_class, nb)); prev_class = 1;
+        if (zeros) { ts.emit_run(zeros, context_id(run_start_sb, prev_class)); zeros = 0; prev_class = 0; }
+        ts.emit_nonzero(v, context_id(sm.id[idx], prev_class)); prev_class = 1;
     }
-    if (zeros) ts.emit_run(zeros, context_id(run_start_sb, prev_class, run_start_nb));
+    if (zeros) ts.emit_run(zeros, context_id(run_start_sb, prev_class));
     a.dc = static_cast<f32>(mean);
     a.toks = std::move(ts.toks);
     a.ctx = std::move(ts.ctx);
@@ -342,13 +317,11 @@ inline void decode_chunk_shared(const Payload& p, const SharedTables* shared,
     u32 oi = 0;            // position in `order`
     u32 prev_class = 1;    // matches the encoder's initial prev_class
     for (u32 t = 0; t < ntok; ++t) {
-        // context = level-bucket × prev_class × causal-neighbor-magnitude bucket,
-        // all derived from the START position (oi) and already-decoded same-subband
-        // neighbors — identical to what the encoder computed there.
+        // context = level-bucket × prev_class, from the subband at the START
+        // position (oi) — identical to what the encoder computed there.
         u32 idx0 = (oi < CHUNK_VOX) ? order[oi] : 0;
         u32 sb = (oi < CHUNK_VOX) ? sm.id[idx0] : 0;
-        u32 nb = (oi < CHUNK_VOX) ? neigh_bucket(causal_neigh_sum(ql, sm, idx0)) : 0;
-        u32 token = dec.get((*tbls)[context_id(sb, prev_class, nb)]);
+        u32 token = dec.get((*tbls)[context_id(sb, prev_class)]);
         if (token >= RUN_BASE) {                       // zero run
             u32 rb = run_raw_bits(token);
             u32 raw = rb ? br.get(rb) : 0;
