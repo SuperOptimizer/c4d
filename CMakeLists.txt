@@ -11,12 +11,25 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Performance baseline (§0): -O3, native arch, fast-math allowed (no
-# cross-platform byte determinism required).
+# cross-platform byte determinism required). Verified: GCC emits AVX-512/AVX2 +
+# FMA across the DWT and quantizer (the hot vectorizable loops); the remaining
+# scalar loops (rANS renorm, per-token codec) are inherently serial. GCC beats
+# clang here. constexpr is already maxed for throughput (the only runtime table,
+# the per-voxel SubbandMap, is a one-time process-lifetime build, not per-chunk).
 set(C4D_OPT_FLAGS -O3 -march=native -ffast-math -funroll-loops)
 
 option(C4D_SANITIZE "Build with ASan+UBSan" OFF)
 option(C4D_BUILD_TESTS "Build tests" ON)
 option(C4D_BUILD_CLI "Build the c4d CLI" ON)
+option(C4D_LTO "Link-time optimization (helps the multi-TU CLI)" ON)
+
+if(C4D_LTO AND NOT C4D_SANITIZE)
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT C4D_IPO_OK)
+  if(C4D_IPO_OK)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+  endif()
+endif()
 
 # Header-only core library (§0: header-heavy, constexpr/consteval).
 add_library(c4d INTERFACE)
