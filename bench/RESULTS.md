@@ -37,8 +37,19 @@ Build: `cmake -DC4D_BUILD_C3D_BENCH=ON -DC3D_DIR=~/c3d ...`; run
   zero quality cost. This is the §4.9 SIMD DWT + SIMD quant paying off.
 - **Threading context:** c3d is OpenMP-parallel; on 16 cores it reaches ~146ms
   enc / 162ms dec at 10× — i.e. c4d **single-threaded** ≈ c3d **16-threaded**.
-  Since c4d's model is caller-parallel-across-chunks (spec §0), it has ~16× more
-  headroom on the same box.
+  c4d's model is caller-parallel-across-chunks (spec §0), but see scaling below.
+
+## Absolute throughput (measured, this box: AVX-512, 16 cores)
+
+| | 1 core | 16 cores |
+|---|-------|----------|
+| encode | ~70 MB/s (73 Mvox/s) | ~0.45 GB/s |
+| decode | ~94 MB/s (99 Mvox/s) | ~0.45 GB/s |
+
+Parallel scaling is **~6.4×** at 16 cores, not 16× — the codec is
+**memory-bandwidth bound** (each chunk streams 2 MB through DWT→quant→entropy).
+Still short of the spec's 1.4-2.1 GB/s aspiration; the remaining lever is the
+scalar rANS (last un-SIMD'd hot stage) + cutting memory passes.
 
 Caveat: c4d at 128³ pays a fixed per-chunk overhead (freq table ~256B + step
 table 160B) ⇒ 8 chunks/256³ carry it 8×; negligible on dense data but a known
