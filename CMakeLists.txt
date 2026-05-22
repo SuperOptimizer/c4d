@@ -38,6 +38,20 @@ if(C4D_BUILD_CLI)
   c4d_tune(c4d_cli)
 endif()
 
+# Optional head-to-head benchmark against c3d v1 (needs C3D_DIR pointing at a
+# c3d checkout with build/libc3d.a). Off unless C3D_DIR is set.
+option(C4D_BUILD_C3D_BENCH "Build the c4d-vs-c3d benchmark" OFF)
+if(C4D_BUILD_C3D_BENCH AND C3D_DIR)
+  find_package(OpenMP)
+  add_executable(compare_c3d bench/compare_c3d.cpp)
+  target_link_libraries(compare_c3d PRIVATE c4d ${C3D_DIR}/build/libc3d.a)
+  target_include_directories(compare_c3d PRIVATE ${C3D_DIR})
+  if(OpenMP_CXX_FOUND)
+    target_link_libraries(compare_c3d PRIVATE OpenMP::OpenMP_CXX)
+  endif()
+  c4d_tune(compare_c3d)
+endif()
+
 if(C4D_BUILD_TESTS)
   enable_testing()
   file(GLOB C4D_TEST_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_*.cpp)
