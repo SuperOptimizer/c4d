@@ -121,9 +121,13 @@ inline StepFieldCache& step_cache() noexcept {
 }
 
 // Quantize a whole transformed cube into integer levels using the step table.
-inline void quantize(std::span<const f32> coeffs, const StepTable& t,
-                     std::span<i32> out) noexcept {
+// Returns the number of NONZERO levels — free here (this pass already visits
+// every coefficient), and it lets the token generator pick a sparse vs dense
+// code path (the high- vs low-compression regimes).
+inline u32 quantize(std::span<const f32> coeffs, const StepTable& t,
+                    std::span<i32> out) noexcept {
     std::span<const f32> step(step_field(t), CHUNK_VOX);
+    u32 nnz = 0;
 #ifdef C4D_QUANT_SIMD
     // Work entirely in the float domain (masks are native to vf), produce a
     // signed float level, then one cast to int. Matches dead_zone_quantize.
@@ -143,11 +147,13 @@ inline void quantize(std::span<const f32> coeffs, const StepTable& t,
         where((a < 0.5f * s) || (s <= 0.f), qf) = 0.0f;     // dead zone / no step
         vi q = stdx::static_simd_cast<vi>(qf);
         q.copy_to(&out[i], stdx::element_aligned);
+        nnz += stdx::popcount(q != 0);                      // nonzero lanes
     }
-    for (; i < CHUNK_VOX; ++i) out[i] = dead_zone_quantize(coeffs[i], step[i]);
+    for (; i < CHUNK_VOX; ++i) { i32 q = dead_zone_quantize(coeffs[i], step[i]); out[i] = q; nnz += (q != 0); }
 #else
-    for (u32 i = 0; i < CHUNK_VOX; ++i) out[i] = dead_zone_quantize(coeffs[i], step[i]);
+    for (u32 i = 0; i < CHUNK_VOX; ++i) { i32 q = dead_zone_quantize(coeffs[i], step[i]); out[i] = q; nnz += (q != 0); }
 #endif
+    return nnz;
 }
 
 // Dequantize integer levels back to coefficients (out = q * step, mid-tread).

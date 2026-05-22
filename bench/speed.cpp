@@ -13,6 +13,7 @@ using clk = std::chrono::steady_clock;
 int main(int argc, char** argv) {
     const u32 NCH = (argc > 1) ? std::atoi(argv[1]) : 64;   // chunks (one region)
     const int ITERS = (argc > 2) ? std::atoi(argv[2]) : 5;
+    const f32 Q = (argc > 3) ? (f32)std::atof(argv[3]) : 16.f;   // quality knob
     std::mt19937 rng(12345);
     std::normal_distribution<f32> noise(0.f, 6.f);
 
@@ -31,7 +32,7 @@ int main(int argc, char** argv) {
     for (auto& c : cubes) spans.emplace_back(c);
 
     const double mb = double(NCH) * CHUNK_VOX / (1024.0*1024.0);
-    chunk::EncodeOpts opt{.q = 16.f};
+    chunk::EncodeOpts opt{.q = Q};
 
     // warm up scratch arenas
     auto ge0 = chunk::encode_group(spans, opt);

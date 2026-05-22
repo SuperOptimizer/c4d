@@ -22,6 +22,10 @@
 #include <cstdlib>
 #include <span>
 #include <vector>
+#if __has_include(<experimental/simd>)
+#  include <experimental/simd>
+#  define C4D_CHUNK_SIMD 1
+#endif
 
 namespace c4d::chunk {
 
@@ -209,7 +213,7 @@ inline ChunkAnalysis analyze_chunk(std::span<const u8> vox, const EncodeOpts& op
     f64 sigma = (opt.noise_aware || opt.perceptual_rdo) ? estimate_noise_sigma(coef) : 0.0;
     if (opt.noise_aware)   a.steps = NoiseShrink::analyze(coef).apply(a.steps, opt.shrink_strength);
     if (opt.perceptual_rdo) a.steps = PerceptualRDO::apply(a.steps, vox, sigma, opt.rdo_strength);
-    quantize(coef, a.steps, ql);
+    u32 nnz = quantize(coef, a.steps, ql);
 
     TokenStream ts;
     const SubbandMap& sm = subband_map();
@@ -218,8 +222,47 @@ inline ChunkAnalysis analyze_chunk(std::span<const u8> vox, const EncodeOpts& op
     // random-gather order[] indirection). Context per token: subband level ×
     // prev-token-class; a run uses the subband at its START position.
     u32 zeros = 0, prev_class = 1, run_start_sb = 0;
-    for (u32 idx = 0; idx < CHUNK_VOX; ++idx) {
-        i32 v = ql[idx];
+    const i32* q = ql.data();
+    u32 idx = 0;
+    // Two regimes (the high- vs low-compression split). When the chunk is SPARSE
+    // (high ratio: most VW-blocks all-zero) the SIMD block-skip folds whole zero
+    // blocks into the run-count with no per-element branch — a big win (the
+    // per-voxel `if(v==0)` is the dominant branch-miss source, and at 100x+ ratio
+    // 98% of blocks are skippable). When the chunk is DENSE (low ratio: nonzeros
+    // everywhere) the block test almost never fires, so it's pure overhead — use
+    // the plain scalar loop instead. The gate is the measured nonzero count from
+    // quantize (free). Both paths emit byte-identical tokens/contexts.
+#ifdef C4D_CHUNK_SIMD
+    namespace stdx = std::experimental;
+    using vi = stdx::native_simd<i32>;
+    constexpr u32 VW = vi::size();
+    // Threshold: engage block-skip only when all-zero VW-blocks clearly
+    // dominate (so the OR-reduction + mixed-block reloop is more than paid for
+    // by the blocks it skips). Measured crossover: block-skip wins once ~50%+ of
+    // VW-blocks are all-zero, which is density ~6% (nnz*16 < CHUNK_VOX). Above
+    // that density the plain scalar loop is faster — see bench RESULTS q-sweep.
+    const bool sparse = (u64(nnz) * 16 < CHUNK_VOX);
+    if (sparse) {
+        for (; idx + VW <= CHUNK_VOX; idx += VW) {
+            vi block(&q[idx], stdx::element_aligned);
+            // All-zero test via integer OR-reduction (one vpor tree + a scalar
+            // compare) — tighter than a mask any_of on the rare mixed block.
+            if (stdx::reduce(block, std::bit_or<>()) == 0) {
+                if (zeros == 0) run_start_sb = sm.id[idx];
+                zeros += VW;
+                continue;
+            }
+            for (u32 j = idx; j < idx + VW; ++j) {  // mixed block: exact scalar
+                i32 v = q[j];
+                if (v == 0) { if (zeros == 0) run_start_sb = sm.id[j]; ++zeros; continue; }
+                if (zeros) { ts.emit_run(zeros, context_id(run_start_sb, prev_class)); zeros = 0; prev_class = 0; }
+                ts.emit_nonzero(v, context_id(sm.id[j], prev_class)); prev_class = 1;
+            }
+        }
+    }
+#endif
+    for (; idx < CHUNK_VOX; ++idx) {               // dense path / remainder / non-SIMD
+        i32 v = q[idx];
         if (v == 0) {
             if (zeros == 0) run_start_sb = sm.id[idx];
             ++zeros; continue;
