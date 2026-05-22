@@ -1,8 +1,10 @@
 // Static rANS entropy coder — 32-bit state, 16-bit renormalization, static
-// per-chunk histograms (12-bit total frequency precision). Spec §4.9.
-//
-// Correctness-first scalar implementation. The interleaved-SIMD variant
-// (8/16/32-way, §4.9) is a later drop-in: same byte framing, lanes interleaved.
+// per-chunk (or region-shared) histograms (12-bit total frequency precision).
+// Spec §4.9. Single scalar state; the per-token divide is replaced by a
+// precomputed reciprocal-multiply (FreqTable::divf). Interleaved-SIMD rANS was
+// assessed and not adopted: the entropy stage is ~15-20% of each direction and
+// its main cost (the divide) is already gone, so the added complexity isn't
+// worth it for this codec's throughput profile.
 //
 // Two cooperating streams (the JPEG XL split, §4.7 HybridUint):
 //   - the rANS symbol stream: small token alphabet, static histogram;

@@ -2,14 +2,17 @@
 // whole-sample symmetric (mirror) boundary extension at chunk faces.
 // Spec §4.1, §4.4 (mirror REQUIRED), §4.5 (unit-L2).
 //
-// Layout: the transform operates in place on a dense CHUNK^3 float buffer in
-// Z,Y,X order (index = (z*CHUNK + y)*CHUNK + x). After a forward transform the
+// Layout: the caller's buffer is dense CHUNK^3 in Z,Y,X order (index =
+// (z*CHUNK + y)*CHUNK + x). forward()/inverse() repack into a slice-padded
+// scratch (SLICE z-pitch) for the transform to avoid power-of-2 cache-set
+// aliasing on the strided Z/Y passes, then repack out. After a forward the
 // subbands occupy the standard Mallat pyramid layout: the level-0 high bands
 // fill the outer half-cubes, with each coarser level nested in the LLL octant.
 //
-// This is the correctness reference: a straightforward separable lifting along
-// each axis. The fused single-loop "cube core" + SIMD variant (§4.9) is a drop-in
-// replacement to be added once roundtrip parity is locked.
+// SIMD: Y/Z passes lift VW contiguous columns per pass (fwd_1d_v); the stride-1
+// X pass transposes VW rows into lanes (fwd_1d_vx, AVX-512 16x16 register
+// transpose with a scalar fallback). Per-axis lifting; the multi-level transform
+// recurses into the LLL octant.
 #pragma once
 #include "core.hpp"
 #include "dwt_tables.hpp"

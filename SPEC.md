@@ -558,15 +558,14 @@ verified exact (t=1→max_err 1, ~0.15% outliers).
 - **bivariate parent-child shrinkage (§4.10) — measured-and-skipped.** A fine-grid
   RD sweep shows all shrinkage variants slide along the frontier here; bivariate
   is the same mechanism ⇒ same frontier ⇒ no gain.
-- **TCQ — built as an experiment, NOT shipped.** The ceiling estimate said
-  ~0.5-0.7 dB, but the realized 4-state coset implementation *loses* at matched
-  rate (+0.2-0.35 dB for +0.3-0.8 bits/coeff — a net loss): the simplified
-  coset-storage doesn't reproduce Marcellin's exact union-index coding where the
-  trellis bit is ~0.5 bit and the level entropy drops below fine-scalar. The
-  correct bitstream is a major frozen-format undertaking with uncertain payoff
-  given this corpus's already-optimal frontier. `tcq.hpp` kept as a measured
-  reference; revisit only with the exact index coding if a future corpus shows
-  frontier slack.
+- **TCQ — built as an experiment, measured-and-removed.** The ceiling estimate
+  said ~0.5-0.7 dB, but a realized 4-state coset implementation *lost* at matched
+  rate (+0.2-0.35 dB for +0.3-0.8 bits/coeff): the simplified coset-storage
+  doesn't reproduce Marcellin's exact union-index coding where the trellis bit is
+  ~0.5 bit and the level entropy drops below fine-scalar. The correct bitstream is
+  a major frozen-format undertaking with uncertain payoff given this corpus's
+  already-optimal frontier. Revisit only with the exact index coding if a future
+  corpus shows frontier slack.
 
 **Other deferred:** mask neighbor-occupancy + planar-mode (§5.3 steps 2-3 —
 **measured-and-skipped**: the gap-rANS DAG is already within 0.7% of entropy;

@@ -70,7 +70,7 @@ target for a shared/default-table optimization.
 
 Relaxing chunk independence (encode reads 26 uncompressed neighbors, decode reads
 26 compressed) enabled region-shared entropy tables + spatial-neighbor context.
-Measured on cmp256/p172_a.raw (256³ = one region), single-thread, matched by ratio:
+Measured on a 256³ region (one shared-table group), single-thread, matched by ratio:
 
 | quality | c3d v1 | c4d v2 | speed (c4d enc/dec vs c3d) |
 |--------:|-------:|-------:|---------------------------|

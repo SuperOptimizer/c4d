@@ -43,6 +43,13 @@
 build/
 Build/
 build-*/
+build_*/
+
+# Local test/benchmark corpora (synthetic fallback used when absent; tests
+# generate their own data — see tests/test_outlier.cpp load_or_synth)
+testdata/
+testdata*/
+cmp256/
 
 # CMake generated files
 CMakeFiles/
