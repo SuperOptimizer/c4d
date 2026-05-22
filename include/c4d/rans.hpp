@@ -108,6 +108,7 @@ private:
 // --- rANS symbol encoder (reverse) -----------------------------------------
 class Encoder {
 public:
+    Encoder() { out_.reserve(1 << 15); }    // avoid the early geometric reallocs
     void put(const FreqTable& t, u32 sym) {
         u32 f = t.freq[sym], c = t.cum[sym];
         // Renorm threshold; u64 because freq up to PROB_SCALE makes this exceed

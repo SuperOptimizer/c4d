@@ -246,17 +246,23 @@ inline Payload finalize_chunk(const ChunkAnalysis& a, const SharedTables* shared
     p.dc = a.dc; p.q = a.q; p.steps = a.steps; p.tolerance = a.tolerance;
     p.shared_tables = (shared != nullptr);
 
+    // Shared path (the production region case) points straight at the group's
+    // tables; `own` stays empty (default FreqTables don't allocate until built).
     const std::array<rans::FreqTable, NUM_CTX>* tbls;
-    std::array<rans::FreqTable, NUM_CTX> own;
-    if (shared) tbls = &shared->tbl;
-    else { for (u32 c = 0; c < NUM_CTX; ++c) own[c] = rans::FreqTable::build(a.counts[c]); tbls = &own; }
+    std::array<rans::FreqTable, NUM_CTX> own;       // only built when !shared
+    if (shared) {
+        tbls = &shared->tbl;
+    } else {
+        for (u32 c = 0; c < NUM_CTX; ++c) own[c] = rans::FreqTable::build(a.counts[c]);
+        tbls = &own;
+        for (u32 c = 0; c < NUM_CTX; ++c) own[c].serialize(p.tokens);  // per-chunk tables
+    }
 
     rans::Encoder enc;
     for (i64 i = static_cast<i64>(a.toks.size()) - 1; i >= 0; --i)
         enc.put((*tbls)[a.ctx[i]], a.toks[i]);
     auto rans_bytes = enc.finish();
 
-    if (!shared) for (u32 c = 0; c < NUM_CTX; ++c) own[c].serialize(p.tokens);  // per-chunk tables
     for (int i = 0; i < 4; ++i) p.tokens.push_back(u8((u32(a.toks.size()) >> (8 * i)) & 0xff));
     p.tokens.insert(p.tokens.end(), rans_bytes.begin(), rans_bytes.end());
     p.bypass = a.bypass_bytes;
