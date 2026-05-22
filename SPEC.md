@@ -245,11 +245,12 @@ each zero as its own rANS symbol wastes both bits and decode cycles.
   and an end-of-block position so the decoder skips the dead HF tail with *zero*
   rANS pulls; replace zero runs with run tokens. **10–30% on HF subbands, and
   faster decode** (fewer symbols). The single best ratio-per-cycle technique.
-- **Frequency-diagonal 3D scan order** (the 3D analog of JPEG zigzag: order each
-  subband by radial frequency so significants come first, zeros collect at the
-  tail): a `constexpr` permutation table, **zero runtime cost**, that ~doubles
-  average run length and so multiplies the EOB/run-coding gain. (Replaces Morton
-  ordering for the coefficient stream.)
+- **Subband-contiguous raster scan order.** The frequency-diagonal (radial,
+  JPEG-zigzag-analog) within-band order was specced here to ~double run length,
+  but **measured-and-rejected** (2026-05): on the dense scroll corpus it *shortens*
+  runs (avg 11.2→10.1, corpus ratio 7.5×→7.3×) because the dense interior already
+  clusters zeros spatially and the radial re-sort scatters that locality. Plain
+  subband-contiguous raster order wins here. (Revisit if a future corpus differs.)
 - **HybridUint token + raw-bits + sign split:** code each coefficient as a small
   magnitude-bucket *token* (rANS) + raw mantissa bits (bypass) + sign. Keeps the
   rANS alphabet small and histograms sharp.
@@ -276,16 +277,27 @@ expensive in tANS/FSE (table rebuild) — a key reason to keep rANS.
 
 ### 4.9 Entropy engine + transform implementation (speed)
 
-- **Interleaved SIMD rANS, 16-bit renormalization**, ≥8-way (16/32-way on AVX2/
-  AVX-512). ~3× decode throughput over scalar (≈1.4–2.1 GB/s class). Static
-  per-chunk histograms (12–14-bit precision; *not* 16-bit on a 32-bit state).
-  Alias tables for O(1) symbol decode once the context count grows.
-- **3D single-loop fused "cube core" lifting** (one streaming pass over all three
-  axes, not three separate passes with intermediate buffers): ~8× over naive,
-  flat per-voxel cost. Diagonal vectorization; lane-count templated for
-  NEON(4)/AVX2(8)/AVX-512(16).
-- **Prime-stride chunk layout** (pad a 128³ chunk's row/slice stride to a prime,
-  e.g. 129/131 floats) to avoid power-of-2 cache-set aliasing on the Y/Z passes.
+- **Scalar 16-bit-renorm rANS** (32-bit state, 12-bit histograms). Interleaved
+  N-way SIMD rANS was specced here for ~3× decode, but **measured-and-skipped**
+  (2026-05): (1) the context model (§4.8) makes each token's context depend on
+  the *previous* token's class, which serializes the decode loop — N independent
+  lanes can't run because lane i+1's table depends on lane i's decoded symbol;
+  interleaving would require dropping the prev-token context axis and ~3% of the
+  §4.8 ratio gain. (2) On the real pipeline the rANS token decode is only ~18% of
+  total decode time — the DWT (now SIMD, §4.9 lifting below) was the actual
+  bottleneck. So the ~10% ratio win of the serial context model beats the bounded
+  ~18%-of-decode speedup of breaking it. (A block-interleave variant — reset
+  context at subband boundaries so lanes are independent within a block — remains
+  a future option if the speed/ratio balance shifts.) Alias tables for O(1)
+  symbol decode remain available if the context count grows.
+- **SIMD multi-line lifting (shipped).** The Y/Z passes (the cache-hostile
+  strided ones) lift `native-width` parallel lines at once — one SIMD lane per
+  innermost-x offset, so consecutive x are contiguous aligned loads. Measured
+  5.4× fwd / 3.9× inv DWT. The X pass stays scalar (already contiguous). The
+  fully-fused single-loop "cube core" (one streaming pass over all three axes)
+  remains a future option. Prime-stride layout (pad to 129/131 to dodge pow-2
+  cache-set aliasing) is also deferred — the multi-line gather already mitigates
+  most of it.
 - **`constexpr`/`consteval`-bake** the lifting constants, per-subband L2 weights,
   scan-order permutation, default alias tables, and context→cluster map.
 
@@ -451,28 +463,37 @@ encoder-side tuning (decoupled from the frozen format — the decoder reads
 quantizer steps from the stream), or measurements. Build order, from the research
 synthesis:
 
-**T0 — Foundation (cheap, do first):** unit-L2-normalized 9/7 (§4.5) with **mirror
-boundary extension** (§4.4); dead-zone quant with per-subband L2-weighted steps;
-HybridUint token+raw-bits+sign coefficient framing; interleaved 16-bit-renorm SIMD
-rANS (§4.9); 3D single-loop fused lifting + prime-stride layout; `constexpr`-baked
-tables.
+> **Implementation status (2026-05): T0, T1, the container, and the metric
+> basket are DONE and validated on real scroll data.** c4d ties c3d v1 on quality
+> and is ~2.5× faster single-thread at equal quality (see `bench/RESULTS.md`).
+> Throughput ~70 MB/s enc / ~94 MB/s dec per core (memory-bandwidth bound, ~6.4×
+> on 16 cores). The status notes below record what shipped vs. what measurement
+> changed.
 
-**T1 — Biggest wins:** (a) **EOB / zero-run / significance coding** (§4.7) —
-10–30% on HF subbands *and* faster decode, the standout; (b) **frequency-diagonal
-3D scan** replacing Morton — free, multiplies (a); (c) **MAD + BayesShrink
-noise-aware dead-zone** (§4.10) — denoise-in-transform, helps ratio *and* quality
-on the noisy scans that are the corpus-confirmed hard case; (d) **outlier pass**
-(§4.6) — hard point-wise-error / constant-quality.
+**T0 — Foundation (DONE):** unit-L2-normalized 9/7 (§4.5) with **mirror boundary
+extension** (§4.4); dead-zone quant with per-subband L2-weighted steps (steps
+carried in the chunk per §4.1); HybridUint token+raw-bits+sign framing; scalar
+16-bit-renorm rANS (interleaved SIMD measured-and-skipped, §4.9); SIMD multi-line
+lifting for the Y/Z passes (the fused single-loop variant remains a future
+option); `constexpr`-baked tables.
 
-**T2 — Measure-then-add:** static context map keyed on neighbor/parent magnitude
-(§4.8, ≈25%/axis decode cost — measure win vs. speed); bivariate parent-child
-shrinkage; perceptual/energy-preserving RDO gated by the MAD noise floor (§4.10);
-TCQ as an optional high-effort encode mode (free decode); uniform-block air
-fast-path.
+**T1 — Biggest wins (DONE):** (a) **EOB / zero-run / significance coding** (§4.7)
+— the standout; (b) within-band scan order — **frequency-diagonal measured WORSE
+on dense scroll data, kept raster** (§4.7); (c) **MAD + BayesShrink noise-aware
+dead-zone** (§4.10) — implemented, OFF by default (measured: loses on the §7.1
+basket on *dense* interior where 'noise' is fiber texture; situational for
+sparse/air-adjacent regions); (d) **outlier pass** (§4.6) — hard point-wise-error,
+verified exact (t=1→max_err 1, ~0.15% outliers).
 
-**Other deferred:** DWT level count (pin where compression saturates for 128³);
-mask octree internals (§5.3, max depth / leaf resolution); parked measurements
-(encode/decode speed baseline, whole-volume aggregate ratio, memory footprint).
+**T2 — Measure-then-add (partial):** static context map (§4.8) **DONE and shipped**
+— clustered to 6 contexts (level-bucket × prev-class), measured ~10% smaller at
+equal quality, ~14% decode cost. Still deferred: bivariate parent-child shrinkage;
+perceptual/energy-preserving RDO; TCQ; uniform-block air fast-path.
+
+**Other deferred:** DWT level count (pinned at 5); mask neighbor-occupancy context
++ planar-mode (§5.3 steps 2–3 — the octree→DAG core is done); fused-lifting +
+block-interleaved rANS if the speed/ratio balance shifts; whole-volume aggregate
+ratio + memory-footprint measurements.
 
 ### 7.1 Encoder objective — the balanced metric basket
 
