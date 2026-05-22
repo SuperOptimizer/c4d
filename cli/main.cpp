@@ -121,16 +121,17 @@ static int encode(int argc, char** argv) {
     }
     Coord3 g = chunk_grid(shape);
     u64 nchunks = g.z * g.y * g.x;
+    Coord3 rg = region_grid(g);
+    u64 nregions = rg.z * rg.y * rg.x;
     std::vector<std::vector<u8>> payloads(nchunks);
     std::vector<f32> qs(nchunks, q);
+    std::vector<std::vector<u8>> region_tables(nregions);   // shared tables/region
+    std::vector<f32> region_table_qs(nregions, 0.f);
     std::vector<std::vector<u8>> mask_payloads;     // only if masking
     std::vector<f32> mask_qs;
     if (mask_thresh >= 0) { mask_payloads.resize(nchunks); mask_qs.assign(nchunks, 0.f); }
-    std::vector<u8> cube(CHUNK_VOX), valid(CHUNK_VOX);
-    u64 mask_total = 0;
-    for (u64 ci = 0; ci < nchunks; ++ci) {
-        Coord3 c = chunk_unravel(ci, g);
-        // gather a zero-padded 128^3 cube from the volume at chunk coord c
+
+    auto gather = [&](Coord3 c, std::vector<u8>& cube) -> bool {
         std::fill(cube.begin(), cube.end(), u8(0));
         u64 z0 = c.z * CHUNK, y0 = c.y * CHUNK, x0 = c.x * CHUNK;
         bool any = false;
@@ -141,19 +142,46 @@ static int encode(int argc, char** argv) {
                 std::memcpy(&cube[vox_index(dz, dy, 0)], &vol[src], w);
                 any = true;
             }
-        if (!any) { payloads[ci] = {}; continue; }   // fully outside -> ABSENT
+        return any;
+    };
 
-        if (mask_thresh >= 0) {
-            // validity grid: voxel > threshold => valid. Pad region stays invalid.
-            for (u32 i = 0; i < CHUNK_VOX; ++i) valid[i] = (cube[i] > u8(mask_thresh)) ? 1 : 0;
-            auto me = mask::encode(valid);
-            mask_payloads[ci] = me.bytes;
-            mask_total += me.bytes.size();
-        }
-        payloads[ci] = chunk::encode_chunk(cube, q).serialize();
+    // Encode REGION BY REGION: each 4×4×4-chunk region shares one entropy-table
+    // set (the +10-14% no-independence win). Chunks fully outside the volume are
+    // ABSENT. Region tables are stored as a separate member, indexed by region.
+    u64 mask_total = 0;
+    std::vector<std::vector<u8>> cubes;
+    for (u64 ri = 0; ri < nregions; ++ri) {
+        Coord3 rc = chunk_unravel(ri, rg);
+        // collect the (up to) REGION_CHUNKS^3 present chunks of this region
+        std::vector<u64> cidx; std::vector<std::span<const u8>> spans; cubes.clear();
+        for (u32 dz = 0; dz < REGION_CHUNKS; ++dz)
+          for (u32 dy = 0; dy < REGION_CHUNKS; ++dy)
+            for (u32 dx = 0; dx < REGION_CHUNKS; ++dx) {
+                Coord3 c{rc.z*REGION_CHUNKS+dz, rc.y*REGION_CHUNKS+dy, rc.x*REGION_CHUNKS+dx};
+                if (c.z >= g.z || c.y >= g.y || c.x >= g.x) continue;
+                std::vector<u8> cube(CHUNK_VOX);
+                if (!gather(c, cube)) { payloads[chunk_linear(c, g)] = {}; continue; }
+                if (mask_thresh >= 0) {
+                    std::vector<u8> valid(CHUNK_VOX);
+                    for (u32 i = 0; i < CHUNK_VOX; ++i) valid[i] = (cube[i] > u8(mask_thresh)) ? 1 : 0;
+                    auto me = mask::encode(valid);
+                    mask_payloads[chunk_linear(c, g)] = me.bytes; mask_total += me.bytes.size();
+                }
+                cidx.push_back(chunk_linear(c, g));
+                cubes.push_back(std::move(cube));
+            }
+        if (cubes.empty()) { region_tables[ri] = {}; continue; }   // empty region
+        for (auto& cb : cubes) spans.emplace_back(cb);
+        auto ge = chunk::encode_group(spans, chunk::EncodeOpts{.q = q});
+        std::vector<u8> tb; ge.tables.serialize(tb);
+        region_tables[ri] = std::move(tb);
+        for (size_t k = 0; k < cidx.size(); ++k)
+            payloads[cidx[k]] = ge.payloads[k].serialize();
     }
     archive::Writer w;
     w.add_member("intensity", archive::MemberType::Intensity, shape, payloads, qs);
+    w.add_member("region_tables", archive::MemberType::Metadata,
+                 Coord3{rg.z, rg.y, rg.x}, region_tables, region_table_qs);
     if (mask_thresh >= 0)
         w.add_member("mask", archive::MemberType::ValidityMask, shape, mask_payloads, mask_qs);
     char meta[160];
@@ -182,14 +210,31 @@ static int decode(int argc, char** argv) {
     if (mi == SIZE_MAX) { std::fprintf(stderr, "no intensity member\n"); return 1; }
     const archive::Member& m = r.member(mi);
     size_t mk = r.find("mask");                 // optional validity mask member
-    Coord3 shape = m.shape, g = chunk_grid(shape);
+    size_t mt = r.find("region_tables");        // region-shared entropy tables
+    Coord3 shape = m.shape, g = chunk_grid(shape), rg = region_grid(g);
     std::vector<u8> vol(shape.z * shape.y * shape.x, 0);
     std::vector<u8> cube(CHUNK_VOX), valid(CHUNK_VOX);
+    // cache the most-recently-loaded region's tables (decode walks region-major-ish)
+    u64 cached_region = ~0ull; chunk::SharedTables cached_tables;
     for (u64 ci = 0; ci < m.index.size(); ++ci) {
         Coord3 c = chunk_unravel(ci, g);
         auto p = r.chunk_payload(mi, ci);
         if (p.empty()) std::fill(cube.begin(), cube.end(), u8(0));
-        else { auto pl = chunk::Payload::deserialize(p); chunk::decode_chunk(pl, cube); }
+        else {
+            auto pl = chunk::Payload::deserialize(p);
+            if (pl.shared_tables && mt != SIZE_MAX) {
+                u64 ri = region_linear(region_of_chunk(c), rg);
+                if (ri != cached_region) {
+                    auto tb = r.chunk_payload(mt, ri);
+                    size_t pos = 0;
+                    cached_tables = chunk::SharedTables::deserialize(tb, pos);
+                    cached_region = ri;
+                }
+                chunk::decode_chunk_shared(pl, &cached_tables, cube);
+            } else {
+                chunk::decode_chunk(pl, cube);
+            }
+        }
         // apply the validity mask (§5.3): invalid voxels forced to 0.
         if (mk != SIZE_MAX) {
             auto mp = r.chunk_payload(mk, ci);
