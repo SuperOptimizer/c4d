@@ -117,7 +117,11 @@ struct TokenStream {
     std::vector<u8>  ctx;                           // per-token context id (0..NUM_CTX)
     rans::BitWriter  bypass;
     std::array<std::vector<u32>, NUM_CTX> counts;   // per-context histograms
-    TokenStream() { for (auto& c : counts) c.assign(ALPHABET, 0); }
+    TokenStream() {
+        for (auto& c : counts) c.assign(ALPHABET, 0);
+        toks.reserve(CHUNK_VOX / 2);                 // avoid geometric realloc
+        ctx.reserve(CHUNK_VOX / 2);
+    }
 
     void emit_nonzero(i32 v, u32 c) {
         u32 mag = static_cast<u32>(v < 0 ? -v : v);
