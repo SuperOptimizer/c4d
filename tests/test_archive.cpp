@@ -11,9 +11,9 @@ using namespace c4d;
 int main() {
     std::mt19937 rng(5);
 
-    // Build a tiny 2x1x2-chunk "volume" (shape 256x128x256 padded grid = 4 chunks),
-    // one of which is all-zero (ABSENT).
-    Coord3 shape{256, 128, 256};
+    // Build a tiny 2x1x2-chunk "volume" (grid 2x1x2 = 4 chunks), one all-zero
+    // (ABSENT). Sized in CHUNK units so it tracks the chunk edge.
+    Coord3 shape{2 * CHUNK, CHUNK, 2 * CHUNK};
     Coord3 grid = chunk_grid(shape);
     CHECK(grid.z == 2 && grid.y == 1 && grid.x == 2);
     u64 nchunks = chunk_count(shape);

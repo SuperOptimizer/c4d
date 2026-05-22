@@ -38,7 +38,7 @@ int main() {
     // half-split (valid where z<64): large uniform halves -> small DAG, exact.
     {
         std::vector<u8> m(CHUNK_VOX, 0), rec(CHUNK_VOX, 9);
-        for (u32 z = 0; z < 64; ++z) for (u32 y = 0; y < 128; ++y) for (u32 x = 0; x < 128; ++x)
+        for (u32 z = 0; z < CHUNK/2; ++z) for (u32 y = 0; y < CHUNK; ++y) for (u32 x = 0; x < CHUNK; ++x)
             m[vox_index(z,y,x)] = 1;
         auto e = mask::encode(m);
         mask::decode(e.bytes, rec);
@@ -49,8 +49,8 @@ int main() {
     // sphere (typical scroll-like single connected component): exact roundtrip.
     {
         std::vector<u8> m(CHUNK_VOX, 0), rec(CHUNK_VOX, 9);
-        f32 cx = 64, cy = 64, cz = 64, r = 50;
-        for (u32 z = 0; z < 128; ++z) for (u32 y = 0; y < 128; ++y) for (u32 x = 0; x < 128; ++x) {
+        f32 c = CHUNK/2.f, cx = c, cy = c, cz = c, r = 0.78f*c;
+        for (u32 z = 0; z < CHUNK; ++z) for (u32 y = 0; y < CHUNK; ++y) for (u32 x = 0; x < CHUNK; ++x) {
             f32 dz=z-cz, dy=y-cy, dx=x-cx;
             if (dz*dz+dy*dy+dx*dx <= r*r) m[vox_index(z,y,x)] = 1;
         }
@@ -77,8 +77,8 @@ int main() {
     // dilation bias: lossy termination only ADDS valid voxels, never removes.
     {
         std::vector<u8> m(CHUNK_VOX, 0), rec(CHUNK_VOX);
-        f32 cx=64,cy=64,cz=64,r=50;
-        for (u32 z = 0; z < 128; ++z) for (u32 y = 0; y < 128; ++y) for (u32 x = 0; x < 128; ++x) {
+        f32 c = CHUNK/2.f, cx = c, cy = c, cz = c, r = 0.78f*c;
+        for (u32 z = 0; z < CHUNK; ++z) for (u32 y = 0; y < CHUNK; ++y) for (u32 x = 0; x < CHUNK; ++x) {
             f32 dz=z-cz,dy=y-cy,dx=x-cx; if (dz*dz+dy*dy+dx*dx <= r*r) m[vox_index(z,y,x)]=1;
         }
         auto e = mask::encode(m, 0.6f);   // lossy: snap >=60%-valid nodes to valid

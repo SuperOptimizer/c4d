@@ -12,12 +12,12 @@ using namespace c4d;
 int main() {
     std::mt19937 rng(8);
 
-    // Build a 128^3 "scroll-ish" chunk: dense material in a sphere, low-value
+    // Build a CHUNK^3 "scroll-ish" chunk: dense material in a sphere, low-value
     // noise floor (air) outside. Threshold separates them.
     std::vector<u8> vox(CHUNK_VOX, 0);
     std::normal_distribution<f32> mat(120.f, 25.f), air(8.f, 4.f);
-    f32 cx=64,cy=64,cz=64,rad=48;
-    for (u32 z=0; z<128; ++z) for (u32 y=0; y<128; ++y) for (u32 x=0; x<128; ++x) {
+    f32 c = CHUNK/2.f, cx=c, cy=c, cz=c, rad=0.75f*c;
+    for (u32 z=0; z<CHUNK; ++z) for (u32 y=0; y<CHUNK; ++y) for (u32 x=0; x<CHUNK; ++x) {
         f32 dz=z-cz,dy=y-cy,dx=x-cx; bool inside = dz*dz+dy*dy+dx*dx <= rad*rad;
         f32 v = inside ? mat(rng) : air(rng);
         vox[vox_index(z,y,x)] = static_cast<u8>(std::clamp(v, 0.f, 255.f));
@@ -29,7 +29,7 @@ int main() {
     for (u32 i=0;i<CHUNK_VOX;++i) valid[i] = (vox[i] > THRESH) ? 1 : 0;
 
     // build a 1-chunk archive with intensity + mask members
-    Coord3 shape{128,128,128};
+    Coord3 shape{CHUNK,CHUNK,CHUNK};
     auto ip = chunk::encode_chunk(vox, 16.f).serialize();
     auto mp = mask::encode(valid).bytes;
     archive::Writer w;

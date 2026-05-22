@@ -26,21 +26,29 @@ using f64 = double;
 // S3 LIST storms over a million small chunk-files) no longer exists. Prefetch
 // locality, if wanted, is a write-time payload ordering hint (Morton/Z-order),
 // not a format structure.
-inline constexpr u32 CHUNK   = 128;            // codec atom edge, voxels
-inline constexpr u32 CHUNK_VOX = CHUNK * CHUNK * CHUNK;          // 2,097,152
+// Chunk edge, pinned by measurement. 64³ (not 128³): with cross-chunk SHARED
+// entropy tables (now allowed — chunk independence is relaxed, §3), 64³ matches
+// or slightly beats 128³ on the RD frontier (small chunks adapt local statistics
+// better; the per-chunk table overhead that used to penalize them is amortized
+// across a table-group). 64³ also gives 8× finer random access and an 8× cheaper
+// cold neighbor-fetch for the decode-time seam heal. 32³ adds a few % more ratio
+// but 64× the chunk count (index/seam/metadata all blow up) — 64³ is the sweet
+// spot. Overridable for re-sweeps.
+#ifndef C4D_CHUNK
+#define C4D_CHUNK 64
+#endif
+inline constexpr u32 CHUNK   = C4D_CHUNK;      // codec atom edge, voxels
+inline constexpr u32 CHUNK_VOX = CHUNK * CHUNK * CHUNK;
 
-static_assert(CHUNK == 128 && (CHUNK & (CHUNK - 1)) == 0, "chunk must be 128 = 2^7");
+static_assert((CHUNK & (CHUNK - 1)) == 0, "chunk edge must be a power of two");
 
-// --- Transform (spec §4.1) -------------------------------------------------
-// 9/7 lifting, float32, separable Z then Y then X. Level count: 128 = 2^7
-// permits 7; pinned where compression saturates (deferred §7). Default 5.
-// DWT level count, pinned by measurement (§4.1, §7): on the 128³ scroll corpus
-// compression SATURATES at 4 levels — 4→5→6→7 changes ratio by 0.00× and PSNR by
-// <0.03 dB (the LLL approximation at 4 levels = 8³ already holds the LF energy;
-// deeper decomposition of an 8³ block only adds coding overhead). 4 is the sweet
-// spot: identical RD, one fewer transform pass. Overridable for re-sweeps.
+// --- Transform -------------------------------------------------------------
+// 9/7 lifting, float32, separable Z then Y then X. Level count pinned by
+// measurement: at 64³ compression saturates by 2–3 levels (the LLL approximation
+// at 3 levels = 8³ holds the LF energy; deeper adds only coding overhead). 3 is
+// the sweet spot — best PSNR, clean 8³ LLL, matching 128³-at-4-levels. Overridable.
 #ifndef C4D_DWT_LEVELS
-#define C4D_DWT_LEVELS 4
+#define C4D_DWT_LEVELS 3
 #endif
 inline constexpr u32 DWT_LEVELS = C4D_DWT_LEVELS;
 static_assert(DWT_LEVELS >= 1 && (CHUNK >> DWT_LEVELS) >= 1,

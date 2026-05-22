@@ -16,6 +16,7 @@
 #include "rans.hpp"
 #include "hybrid_uint.hpp"
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <span>
 #include <unordered_map>
@@ -23,8 +24,8 @@
 
 namespace c4d::mask {
 
-inline constexpr u32 MASK_EDGE = CHUNK;       // 128
-inline constexpr u32 MASK_DEPTH = 7;          // log2(128)
+inline constexpr u32 MASK_EDGE = CHUNK;                       // = chunk edge
+inline constexpr u32 MASK_DEPTH = std::countr_zero(CHUNK);    // log2(CHUNK)
 
 // --- octree node (uniform leaf or 8-way internal) --------------------------
 // Encoded form: a post-order node list. Leaf nodes carry a value bit; internal
