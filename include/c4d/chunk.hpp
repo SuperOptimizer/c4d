@@ -18,7 +18,6 @@
 #include "denoise.hpp"
 #include "rans.hpp"
 #include "hybrid_uint.hpp"
-#include "scan.hpp"
 #include "outlier.hpp"
 #include <cstdlib>
 #include <span>
@@ -188,12 +187,13 @@ inline ChunkAnalysis analyze_chunk(std::span<const u8> vox, const EncodeOpts& op
     quantize(coef, a.steps, ql);
 
     TokenStream ts;
-    const std::vector<u32>& order = scan_order().order;
     const SubbandMap& sm = subband_map();
-    // Context per token: subband level × prev-token-class. A run token uses the
-    // subband at its START position; a magnitude token uses its own position.
+    // Linear scan in raster (Z,Y,X) order — the subband-order permutation was
+    // dropped (it bought only ~3% ratio for a ~10-14% tokengen cost from the
+    // random-gather order[] indirection). Context per token: subband level ×
+    // prev-token-class; a run uses the subband at its START position.
     u32 zeros = 0, prev_class = 1, run_start_sb = 0;
-    for (u32 idx : order) {
+    for (u32 idx = 0; idx < CHUNK_VOX; ++idx) {
         i32 v = ql[idx];
         if (v == 0) {
             if (zeros == 0) run_start_sb = sm.id[idx];
@@ -309,18 +309,16 @@ inline void decode_chunk_shared(const Payload& p, const SharedTables* shared,
     rans::Decoder dec(rans_bytes);
     rans::BitReader br(p.bypass);
 
-    // Reconstruct quantized levels in the same canonical scan order, then scatter.
-    const std::vector<u32>& order = scan_order().order;
+    // Reconstruct quantized levels in linear raster order (matching encode).
     const SubbandMap& sm = subband_map();
 
     std::vector<i32> ql(CHUNK_VOX, 0);
-    u32 oi = 0;            // position in `order`
+    u32 oi = 0;            // linear position
     u32 prev_class = 1;    // matches the encoder's initial prev_class
     for (u32 t = 0; t < ntok; ++t) {
         // context = level-bucket × prev_class, from the subband at the START
         // position (oi) — identical to what the encoder computed there.
-        u32 idx0 = (oi < CHUNK_VOX) ? order[oi] : 0;
-        u32 sb = (oi < CHUNK_VOX) ? sm.id[idx0] : 0;
+        u32 sb = (oi < CHUNK_VOX) ? sm.id[oi] : 0;
         u32 token = dec.get((*tbls)[context_id(sb, prev_class)]);
         if (token >= RUN_BASE) {                       // zero run
             u32 rb = run_raw_bits(token);
@@ -333,7 +331,7 @@ inline void decode_chunk_shared(const Payload& p, const SharedTables* shared,
             u32 raw = rb ? br.get(rb) : 0;
             u32 mag = hybrid::decode(token, raw);
             u32 sign = br.get(1);
-            ql[order[oi++]] = sign ? -static_cast<i32>(mag) : static_cast<i32>(mag);
+            ql[oi++] = sign ? -static_cast<i32>(mag) : static_cast<i32>(mag);
             prev_class = 1;
         }
     }

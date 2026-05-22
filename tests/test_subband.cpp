@@ -2,7 +2,6 @@
 // subband; coefficient counts per subband match the dyadic pyramid geometry.
 #include "c4d/subband.hpp"
 #include "c4d/dwt.hpp"
-#include "c4d/scan.hpp"
 #include "check.hpp"
 #include <map>
 #include <vector>
@@ -44,24 +43,6 @@ int main() {
         check_total += 7 * band;
     }
     CHECK(check_total == CHUNK_VOX);
-
-    // Scan order must be a valid permutation: every coefficient index exactly
-    // once, and subband-contiguous (all of one band before the next).
-    {
-        const auto& ord = scan_order().order;
-        CHECK(ord.size() == CHUNK_VOX);
-        std::vector<u8> seen(CHUNK_VOX, 0);
-        bool dup = false, oob = false;
-        for (u32 i : ord) { if (i >= CHUNK_VOX) oob = true; else { if (seen[i]) dup = true; seen[i] = 1; } }
-        CHECK(!oob); CHECK(!dup);
-        u32 missing = 0; for (u8 s : seen) if (!s) ++missing;
-        CHECK(missing == 0);
-        // subband-contiguous: id is non-decreasing along the scan
-        const SubbandMap& sm = subband_map();
-        bool monotone = true; u8 prev = 0;
-        for (u32 i : ord) { if (sm.id[i] < prev) monotone = false; prev = sm.id[i]; }
-        CHECK(monotone);
-    }
 
     RUN_TESTS_RETURN();
 }
