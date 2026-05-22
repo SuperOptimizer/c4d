@@ -1,102 +1,55 @@
 # c4d vs c3d v1 — benchmark
 
-Head-to-head on identical **256³ dense scroll-interior** volumes (97-99% nonzero,
-from `s3://vesuvius-challenge`). c4d encodes as 8× its native 128³ chunks; c3d
-encodes the 256³ as one native chunk. Same voxels, each codec's native unit.
-Quality = §7.1 basket; speed = wall time (one machine, AVX-512, 16 cores).
+Head-to-head on real **256³ ESRF Paris4 scroll-interior** volumes (source v2 zarr,
+level 0, ~100% nonzero). c4d encodes the 256³ as one region = **4×4×4 = 64 native
+64³ chunks** sharing one entropy-table set (the production path, `encode_group`);
+c3d encodes the 256³ as one native 256³ chunk. Same voxels, each codec's native
+unit. Quality = §7.1 basket; speed = wall time on one AVX-512 box.
 
 Build: `cmake -DC4D_BUILD_C3D_BENCH=ON -DC3D_DIR=~/c3d ...`; run
-`compare_c3d <vol256.raw> [q...]`.
+`compare_c3d <vol256.raw> [c4d_q...]` (c3d needs `-fopenmp`).
 
-## PHerc0172 (clean, 7.9µm) — matched by ratio, SINGLE-THREAD
+## Quality per byte — matched by ratio (two regions, consistent)
 
-| ratio | codec | PSNR  | GMSD  | MS-SSIM | HaarPSI | geomean | enc ms | dec ms |
-|------:|-------|------:|------:|--------:|--------:|--------:|-------:|-------:|
-| ~5×   | c3d   | 40.72 | 0.978 | 0.997   | 0.987   | 0.941   | 601    | 465    |
-|       | c4d   | 40.38 | 0.977 | 0.997   | 0.985   | 0.938   | **330**| **222**|
-| ~10×  | c3d   | 35.42 | 0.948 | 0.988   | 0.966   | 0.895   | 540    | 431    |
-|       | c4d   | 35.39 | 0.947 | 0.989   | 0.964   | 0.894   | **233**| **167**|
-| ~15×  | c3d   | 32.75 | 0.926 | 0.978   | 0.949   | 0.866   | 524    | 394    |
-|       | c4d   | 32.72 | 0.925 | 0.979   | 0.947   | 0.866   | **208**| **151**|
+| ratio | codec | PSNR  | MS-SSIM | HaarPSI |
+|------:|-------|------:|--------:|--------:|
+| ~79×  | c3d   | 36.68 | 0.967   | 0.928   |
+|       | c4d   | 35.31 | 0.955   | 0.907   |
+| ~189× | c3d   | 32.86 | 0.930   | 0.887   |
+|       | c4d   | 31.3  | 0.901   | 0.853   |
 
-## PHerc1667 (noisy, 3.24µm) — matched by ratio, SINGLE-THREAD
+**c3d wins ~1.0–1.4 dB PSNR per byte at the shipped 64³.** This is a deliberate
+tradeoff, not a defect: c4d's 64³ chunk is fixed for fine-grained random access
+(any 64³ block is one range-GET). Smaller tiles mean more boundary/seam voxels
+and less wavelet context per chunk than c3d's 256³.
 
-| ratio | codec | PSNR  | geomean | enc ms | dec ms |
-|------:|-------|------:|--------:|-------:|-------:|
-| ~10×  | c3d   | 32.85 | 0.858   | 563    | 455    |
-|       | c4d   | 31.99 | 0.849   | **234**| **166**|
-| ~15×  | c3d   | 30.23 | 0.820   | 532    | 397    |
-|       | c4d   | 30.14 | 0.823   | **204**| **150**|
+**Diagnosed:** rebuilding c4d at 128³/256³ closes most of the gap — at 256³ c3d
+wins only ~0.3–0.5 dB (e.g. 79.7×: c4d-256 36.37 vs c3d 36.68). DWT levels are
+*not* the lever (64³ at 3/4/6 levels is identical). So ~1 dB of the gap is the
+64³ random-access granularity; the residual ~0.3 dB is c3d's RD-allocator vs
+c4d's per-subband-L2 step policy.
 
-> **Note (post-§4.8 context modeling):** the table above predates the static
-> context map. With it, c4d's ratios rose ~10% (e.g. q16 8.9×→9.6×, q24
-> 13.1×→14.3× at the same quality), making the quality/ratio race a true dead
-> heat — at any matched quality c4d and c3d land within a few % on ratio,
-> trading the lead point to point. The speed win is unchanged. Re-run
-> `compare_c3d` for current exact numbers.
+## Speed — c4d's advantage
+
+c4d **single-threaded** vs c3d **OpenMP multi-threaded**, same box, matched ratio:
+
+| | c4d enc | c3d enc | c4d dec | c3d dec |
+|---|-------:|--------:|--------:|--------:|
+| ~79× (q16/q32) | 46–63 ms | ~119 ms | 37–51 ms | ~91 ms |
+
+**c4d is ~2–2.5× faster wall-clock despite being single-threaded** (c3d is using
+all cores). Per-core the advantage is much larger; c4d's model is caller-parallel
+across chunks (one thread per chunk, all thread-safe via per-thread scratch).
 
 ## Verdict
 
-- **Quality/ratio: a dead heat.** At matched quality c4d and c3d are within a few
-  % on ratio everywhere (c3d a hair ahead on clean ~5-15×, c4d ahead on noisy
-  ~15×); within 0.03 dB PSNR / 0.001 geomean. No clear winner, no regression.
-- **Speed: c4d wins ~2.5×** single-thread (enc ~2.4-2.5×, dec ~2.6-2.8×), equal
-  quality, every operating point. The decisive, repeatable advantage (§4.9 SIMD
-  DWT + SIMD quant).
-- **Plus capabilities c3d lacks:** hard-L∞ near-lossless mode (outlier pass §4.6),
-  single-file archive with append/compose/compact (§5.5-5.7), optional
-  validity-mask member (§5.3), perceptual metric basket (§7.1) — at no quality cost.
-- **Threading context:** c3d is OpenMP-parallel; on 16 cores it reaches ~146ms
-  enc / 162ms dec at 10× — i.e. c4d **single-threaded** ≈ c3d **16-threaded**.
-  c4d's model is caller-parallel-across-chunks (spec §0), but see scaling below.
+c4d trades **~1 dB quality-per-byte (the frozen-64³ random-access tradeoff)** for
+**~2–2.5× throughput** (single- vs multi-threaded) plus capabilities c3d lacks:
 
-## Absolute throughput (measured, this box: AVX-512, 16 cores)
+- 64³ chunk granularity — any block is one range-GET from the single-file archive.
+- Single-file `.c4d` archive: append / compose / compact, footer index.
+- Optional validity-mask member; hard-L∞ near-lossless mode (outlier pass).
 
-| | 1 core | 16 cores |
-|---|-------|----------|
-| encode | ~70 MB/s (73 Mvox/s) | ~0.45 GB/s |
-| decode | ~94 MB/s (99 Mvox/s) | ~0.45 GB/s |
-
-Parallel scaling is **~6.4×** at 16 cores, not 16× — the codec is
-**memory-bandwidth bound** (each chunk streams 2 MB through DWT→quant→entropy).
-Still short of the spec's 1.4-2.1 GB/s aspiration; the remaining lever is the
-scalar rANS (last un-SIMD'd hot stage) + cutting memory passes.
-
-Caveat: c4d at 128³ pays a fixed per-chunk overhead (freq table ~256B + step
-table 160B) ⇒ 8 chunks/256³ carry it 8×; negligible on dense data but a known
-target for a shared/default-table optimization.
-
-## v2 update (64³ chunks + 256³ region-shared tables + spatial-neighbor context)
-
-Relaxing chunk independence (encode reads 26 uncompressed neighbors, decode reads
-26 compressed) enabled region-shared entropy tables + spatial-neighbor context.
-Measured on a 256³ region (one shared-table group), single-thread, matched by ratio:
-
-| quality | c3d v1 | c4d v2 | speed (c4d enc/dec vs c3d) |
-|--------:|-------:|-------:|---------------------------|
-| ~40.4 dB | 5.4× | **5.4×** (tied) | 442/382 ms vs 694/521 |
-| ~35.4 dB | 10.2× | 9.9× | 311/268 ms vs 570/435 |
-| ~32.7 dB | 15.2× | 14.5× | 278/228 ms vs 531/404 |
-
-**c4d v2 ties-or-beats c3d on ratio** (v1 was slightly behind) **and is ~1.8–2×
-faster** single-thread. The +10–14% v2 ratio gain over per-chunk 64³ closed the
-small gap c3d v1 had. Net: c4d v2 is the better codec on ratio, quality (tied),
-and speed (~2×).
-
-## v2 speed pass (profile-guided, no SIMD-rANS needed)
-
-Profiling a 64³ chunk showed tokengen/detok dominate (~56-66%), NOT the DWT,
-and rANS itself is cheap (~15% of decode). Three profile-guided optimizations,
-all byte-exact (no ratio change):
-- **X-axis DWT SIMD** (was scalar, 7× the SIMD Y/Z cost): transpose-tile VW
-  y-rows → lane-major lift. DWT fwd 1.3→0.72 ms, inv 1.3→0.67 ms.
-- **Bypass bit I/O**: BitWriter flushes 32-bit words (not per-byte push_back) +
-  reserve; BitReader refills a word per top-up. Emit path ~21% faster.
-- **Branchless causal-neighbour sum**: power-of-2 mask boundary tests, raw ptrs.
-
-Net single-thread (per 64³ chunk): **encode 44→51 MB/s, decode 54→64 MB/s**
-(~25-35% over the start of the pass; ~8-15× over the original scalar baseline).
-Remaining cost is inherent: the spatial-neighbour context's strided gathers
-(~1.3 ms/side) — a ratio↔speed tradeoff we keep (it's a shipped +5% ratio win),
-not a code inefficiency. Interleaved SIMD rANS deemed unnecessary (rANS is only
-~15% of decode). Single-threaded thread-safe; callers parallelize across chunks.
+For a recompress / serving pipeline that fetches individual chunks, the speed and
+random-access granularity outweigh the ~1 dB. c4d is **not** positioned as a
+higher-quality-per-byte codec than c3d — it's the faster, range-addressable one.
