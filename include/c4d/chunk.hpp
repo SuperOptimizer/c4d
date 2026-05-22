@@ -114,6 +114,8 @@ struct EncodeOpts {
     bool noise_aware = false;     // MAD + BayesShrink dead-zone (§4.10)
     f64 shrink_strength = 1.0;    // 0..1, how aggressively to apply shrinkage
     f32 tolerance = 0;            // outlier pass: hard L-inf bound t (0 => off, §4.6)
+    bool perceptual_rdo = false;  // coherence-gated HF preservation (§4.10)
+    f64 rdo_strength = 0.5;       // 0..1, how much to tighten coherent HF
 };
 
 // Encode one 128^3 u8 chunk. `vox` is row-major Z,Y,X.
@@ -128,8 +130,12 @@ inline Payload encode_chunk(std::span<const u8> vox, const EncodeOpts& opt) {
 
     // 3. choose per-subband steps (encoder policy; decoder reads them back).
     StepTable steps = StepTable::from_q(opt.q);
+    f64 sigma = (opt.noise_aware || opt.perceptual_rdo)
+              ? estimate_noise_sigma(coef) : 0.0;
     if (opt.noise_aware)
         steps = NoiseShrink::analyze(coef).apply(steps, opt.shrink_strength);
+    if (opt.perceptual_rdo)
+        steps = PerceptualRDO::apply(steps, vox, sigma, opt.rdo_strength);
 
     std::vector<i32> ql(CHUNK_VOX);
     quantize(coef, steps, ql);

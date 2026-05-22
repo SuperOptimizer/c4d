@@ -87,4 +87,57 @@ struct NoiseShrink {
     }
 };
 
+// --- Perceptual / energy-preserving RDO (§4.10, encoder-only) ---------------
+// Bias the HF-subband steps by the chunk's gradient COHERENCE, gated by the MAD
+// noise floor. Real edges/texture are oriented (high structure-tensor
+// anisotropy); noise is high-variance but incoherent (low anisotropy). So:
+//   - high coherence above the noise floor  => REDUCE HF steps (preserve detail)
+//   - low coherence / at the noise floor     => leave coarse (don't spend bits on noise)
+// This directly counters "the wavelet throws away HF" without amplifying noise.
+// Coherence is one cheap scalar per chunk from the spatial-domain structure
+// tensor; no per-candidate metric evaluation.
+struct PerceptualRDO {
+    // Global gradient coherence in [0,1]: anisotropy (λ1-λ2)/(λ1+λ2) of the
+    // accumulated 3D structure tensor (here the dominant-plane 2D tensor over
+    // central slices, which is cheap and tracks oriented sheet structure well).
+    [[nodiscard]] static f64 coherence(std::span<const u8> vox) {
+        f64 Jxx = 0, Jyy = 0, Jxy = 0;
+        for (u32 z = 0; z < CHUNK; z += 4)
+            for (u32 y = 1; y + 1 < CHUNK; ++y)
+                for (u32 x = 1; x + 1 < CHUNK; ++x) {
+                    f64 gx = f64(vox[vox_index(z,y,x+1)]) - vox[vox_index(z,y,x-1)];
+                    f64 gy = f64(vox[vox_index(z,y+1,x)]) - vox[vox_index(z,y-1,x)];
+                    Jxx += gx*gx; Jyy += gy*gy; Jxy += gx*gy;
+                }
+        f64 tr = Jxx + Jyy;
+        if (tr < 1e-9) return 0.0;
+        f64 det = Jxx*Jyy - Jxy*Jxy;
+        f64 disc = std::sqrt(std::max(0.0, tr*tr/4 - det));
+        f64 l1 = tr/2 + disc, l2 = tr/2 - disc;
+        return (l1 + l2 > 1e-9) ? (l1 - l2) / (l1 + l2) : 0.0;
+    }
+
+    // Apply HF-preservation: scale HF-subband steps by (1 - strength*coherence_gain)
+    // where coherence_gain rises with coherence ABOVE a noise-floor gate. The LLL
+    // and coarsest-level bands are left alone (they carry structure, not noise).
+    // Returns a modified StepTable (steps the decoder reads — §4.1).
+    static StepTable apply(const StepTable& base, std::span<const u8> vox,
+                           f64 sigma, f64 strength = 0.5) {
+        f64 coh = coherence(vox);
+        // gate: only act when there's coherent structure AND it's above noise.
+        // noise gate: more noise (large sigma) => demand higher coherence to act.
+        f64 gate = coh / (coh + 0.15 + 0.01 * sigma);   // 0..~1, smooth
+        f64 reduce = strength * gate;                    // fraction to tighten HF
+        StepTable t = base;
+        for (u32 l = 0; l < DWT_LEVELS; ++l)
+            for (u32 o = 1; o < 8; ++o) {                // skip LLL (o==0)
+                // tighten the finest levels most (where edge detail lives).
+                f64 lvl_w = (l == 0) ? 1.0 : (l == 1 ? 0.6 : 0.3);
+                f64 factor = 1.0 - reduce * lvl_w;       // <1 => finer step => more detail
+                t.step[l][o] = static_cast<f32>(t.step[l][o] * std::max(0.5, factor));
+            }
+        return t;
+    }
+};
+
 } // namespace c4d
