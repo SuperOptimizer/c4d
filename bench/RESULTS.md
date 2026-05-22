@@ -28,13 +28,24 @@ Build: `cmake -DC4D_BUILD_C3D_BENCH=ON -DC3D_DIR=~/c3d ...`; run
 | ~15×  | c3d   | 30.23 | 0.820   | 532    | 397    |
 |       | c4d   | 30.14 | 0.823   | **204**| **150**|
 
+> **Note (post-§4.8 context modeling):** the table above predates the static
+> context map. With it, c4d's ratios rose ~10% (e.g. q16 8.9×→9.6×, q24
+> 13.1×→14.3× at the same quality), making the quality/ratio race a true dead
+> heat — at any matched quality c4d and c3d land within a few % on ratio,
+> trading the lead point to point. The speed win is unchanged. Re-run
+> `compare_c3d` for current exact numbers.
+
 ## Verdict
 
-- **Quality: essentially tied.** On clean data c4d matches c3d to within 0.03 dB
-  PSNR / 0.001 geomean at every ratio. On noisy data c3d is marginally ahead at
-  ~10× (geomean 0.858 vs 0.849), c4d marginally ahead at ~15×. No regression.
-- **Speed: c4d wins ~2.5×** single-thread (enc ~2.4-2.5×, dec ~2.6-2.8×), with
-  zero quality cost. This is the §4.9 SIMD DWT + SIMD quant paying off.
+- **Quality/ratio: a dead heat.** At matched quality c4d and c3d are within a few
+  % on ratio everywhere (c3d a hair ahead on clean ~5-15×, c4d ahead on noisy
+  ~15×); within 0.03 dB PSNR / 0.001 geomean. No clear winner, no regression.
+- **Speed: c4d wins ~2.5×** single-thread (enc ~2.4-2.5×, dec ~2.6-2.8×), equal
+  quality, every operating point. The decisive, repeatable advantage (§4.9 SIMD
+  DWT + SIMD quant).
+- **Plus capabilities c3d lacks:** hard-L∞ near-lossless mode (outlier pass §4.6),
+  single-file archive with append/compose/compact (§5.5-5.7), optional
+  validity-mask member (§5.3), perceptual metric basket (§7.1) — at no quality cost.
 - **Threading context:** c3d is OpenMP-parallel; on 16 cores it reaches ~146ms
   enc / 162ms dec at 10× — i.e. c4d **single-threaded** ≈ c3d **16-threaded**.
   c4d's model is caller-parallel-across-chunks (spec §0), but see scaling below.
