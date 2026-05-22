@@ -121,6 +121,51 @@ inline void inv_1d_v(f32* base, u32 n, u32 stride) noexcept {
     lift_pass_v<true >(v, n, f32(-ALPHA));
     for (u32 i = 0; i < n; ++i) v[i].copy_to(&base[i * stride], stdx::element_aligned);
 }
+
+// X-axis (stride-1) multi-line lifting: process VW adjacent ROWS (each row a
+// contiguous line of length n at row stride `rowstride`=CHUNK) as SIMD lanes.
+// Gather transposes VW rows into lane-major scratch; lift; scatter transposes
+// back. Folds the deinterleave into the scatter like fwd_1d. `rows` points at
+// the first of VW consecutive rows.
+inline void fwd_1d_vx(f32* rows, u32 n, u32 rowstride) noexcept {
+    alignas(64) f32 tile[CHUNK][VW];
+    for (u32 i = 0; i < n; ++i)                       // transpose-load
+        for (u32 l = 0; l < VW; ++l) tile[i][l] = rows[l * rowstride + i];
+    vf v[CHUNK];
+    for (u32 i = 0; i < n; ++i) v[i] = vf(&tile[i][0], stdx::vector_aligned);
+    lift_pass_v<true >(v, n, f32(ALPHA));
+    lift_pass_v<false>(v, n, f32(BETA));
+    lift_pass_v<true >(v, n, f32(GAMMA));
+    lift_pass_v<false>(v, n, f32(DELTA));
+    const f32 lo = f32(1.0 / KAPPA), hi = f32(KAPPA);
+    const u32 h = n / 2;
+    for (u32 i = 0; i < h; ++i) {
+        (v[2*i]   * lo).copy_to(&tile[i][0],     stdx::vector_aligned);
+        (v[2*i+1] * hi).copy_to(&tile[h+i][0],   stdx::vector_aligned);
+    }
+    for (u32 i = 0; i < n; ++i)                       // transpose-store
+        for (u32 l = 0; l < VW; ++l) rows[l * rowstride + i] = tile[i][l];
+}
+
+inline void inv_1d_vx(f32* rows, u32 n, u32 rowstride) noexcept {
+    alignas(64) f32 tile[CHUNK][VW];
+    for (u32 i = 0; i < n; ++i)
+        for (u32 l = 0; l < VW; ++l) tile[i][l] = rows[l * rowstride + i];
+    vf v[CHUNK];
+    const f32 lo = f32(KAPPA), hi = f32(1.0 / KAPPA);
+    const u32 h = n / 2;
+    for (u32 i = 0; i < h; ++i) {
+        v[2*i]   = vf(&tile[i][0],   stdx::vector_aligned) * lo;
+        v[2*i+1] = vf(&tile[h+i][0], stdx::vector_aligned) * hi;
+    }
+    lift_pass_v<false>(v, n, f32(-DELTA));
+    lift_pass_v<true >(v, n, f32(-GAMMA));
+    lift_pass_v<false>(v, n, f32(-BETA));
+    lift_pass_v<true >(v, n, f32(-ALPHA));
+    for (u32 i = 0; i < n; ++i) v[i].copy_to(&tile[i][0], stdx::vector_aligned);
+    for (u32 i = 0; i < n; ++i)
+        for (u32 l = 0; l < VW; ++l) rows[l * rowstride + i] = tile[i][l];
+}
 #endif
 
 // Inverse 1D 9/7 lifting — exact reverse of fwd_1d, including the interleave:
@@ -145,10 +190,19 @@ inline void inv_1d(f32* p, u32 n, u32 stride) noexcept {
 // buffer, transforming all three axes and packing into Mallat octant layout.
 // fwd_1d folds the deinterleave into its scatter, so each axis is one pass.
 inline void fwd_step(f32* vol, u32 s) noexcept {
-    // X axis (stride 1): contiguous lines, scalar gather is already cache-good.
+    // X axis (stride 1): VW adjacent y-rows per SIMD pass (transpose-tile), scalar
+    // remainder. (Was the slowest axis — 7x the SIMD Y pass — when done scalar.)
+#ifdef C4D_HAVE_SIMD
+    for (u32 z = 0; z < s; ++z) {
+        u32 y = 0;
+        for (; y + VW <= s; y += VW) fwd_1d_vx(vol + (z * CHUNK + y) * CHUNK, s, CHUNK);
+        for (; y < s; ++y)           fwd_1d  (vol + (z * CHUNK + y) * CHUNK, s, 1);
+    }
+#else
     for (u32 z = 0; z < s; ++z)
         for (u32 y = 0; y < s; ++y)
             fwd_1d(vol + (z * CHUNK + y) * CHUNK, s, 1);
+#endif
     // Y axis (stride CHUNK): VW consecutive x per SIMD pass (contiguous loads),
     // scalar remainder. Z axis (stride CHUNK^2) likewise.
 #ifdef C4D_HAVE_SIMD
@@ -185,10 +239,18 @@ inline void inv_step(f32* vol, u32 s) noexcept {
     for (u32 y = 0; y < s; ++y) for (u32 x = 0; x < s; ++x) inv_1d(vol + y*CHUNK + x, s, CHUNK*CHUNK);
     for (u32 z = 0; z < s; ++z) for (u32 x = 0; x < s; ++x) inv_1d(vol + z*CHUNK*CHUNK + x, s, CHUNK);
 #endif
-    // X axis (stride 1)
+    // X axis (stride 1): VW adjacent y-rows per SIMD pass, scalar remainder.
+#ifdef C4D_HAVE_SIMD
+    for (u32 z = 0; z < s; ++z) {
+        u32 y = 0;
+        for (; y + VW <= s; y += VW) inv_1d_vx(vol + (z * CHUNK + y) * CHUNK, s, CHUNK);
+        for (; y < s; ++y)           inv_1d  (vol + (z * CHUNK + y) * CHUNK, s, 1);
+    }
+#else
     for (u32 z = 0; z < s; ++z)
         for (u32 y = 0; y < s; ++y)
             inv_1d(vol + (z * CHUNK + y) * CHUNK, s, 1);
+#endif
 }
 
 // Full multi-level forward transform over a CHUNK^3 buffer. Each level halves
