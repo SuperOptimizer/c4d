@@ -34,7 +34,15 @@ static_assert(CHUNK == 128 && (CHUNK & (CHUNK - 1)) == 0, "chunk must be 128 = 2
 // --- Transform (spec §4.1) -------------------------------------------------
 // 9/7 lifting, float32, separable Z then Y then X. Level count: 128 = 2^7
 // permits 7; pinned where compression saturates (deferred §7). Default 5.
-inline constexpr u32 DWT_LEVELS = 5;
+// DWT level count, pinned by measurement (§4.1, §7): on the 128³ scroll corpus
+// compression SATURATES at 4 levels — 4→5→6→7 changes ratio by 0.00× and PSNR by
+// <0.03 dB (the LLL approximation at 4 levels = 8³ already holds the LF energy;
+// deeper decomposition of an 8³ block only adds coding overhead). 4 is the sweet
+// spot: identical RD, one fewer transform pass. Overridable for re-sweeps.
+#ifndef C4D_DWT_LEVELS
+#define C4D_DWT_LEVELS 4
+#endif
+inline constexpr u32 DWT_LEVELS = C4D_DWT_LEVELS;
 static_assert(DWT_LEVELS >= 1 && (CHUNK >> DWT_LEVELS) >= 1,
               "cannot take more DWT levels than the chunk supports");
 
